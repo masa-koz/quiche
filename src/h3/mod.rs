@@ -1400,7 +1400,17 @@ impl Connection {
 
 /// Generates an HTTP/3 GREASE variable length integer.
 fn grease_value() -> u64 {
-    let n = std::cmp::min(super::rand::rand_u64(), 148_764_065_110_560_899);
+    let range = 148_764_065_110_560_899;
+    let chunk_size = u64::max_value() / range;
+    let end_of_last_chunk = chunk_size * range;
+
+    let mut r = super::rand::rand_u64();
+
+    while r >= end_of_last_chunk {
+        r = super::rand::rand_u64();
+    }
+
+    let n = r / chunk_size;
     31 * n + 33
 }
 
