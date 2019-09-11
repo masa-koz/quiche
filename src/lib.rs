@@ -895,7 +895,10 @@ impl Connection {
 
             max_send_bytes: 0,
 
-            streams: stream::StreamMap::default(),
+            streams: stream::StreamMap::new(
+                config.local_transport_params.initial_max_streams_bidi,
+                config.local_transport_params.initial_max_streams_uni,
+            ),
 
             odcid: None,
 
@@ -946,14 +949,6 @@ impl Connection {
         }
 
         conn.handshake.init(&conn).map_err(|_| Error::TlsFail)?;
-
-        conn.streams.update_local_max_streams_bidi(
-            config.local_transport_params.initial_max_streams_bidi,
-        );
-
-        conn.streams.update_local_max_streams_uni(
-            config.local_transport_params.initial_max_streams_uni,
-        );
 
         // Derive initial secrets for the client. We can do this here because
         // we already generated the random destination connection ID.
@@ -1596,6 +1591,34 @@ impl Connection {
         }
 
         if pkt_type == packet::Type::Short && !is_closing {
+            // Create MAX_STREAMS_BIDI frame.
+            if self.streams.should_update_max_streams_bidi() {
+                let max_streams = self.streams.update_max_streams_bidi();
+                let frame = frame::Frame::MaxStreamsBidi { max: max_streams };
+
+                payload_len += frame.wire_len();
+                left -= frame.wire_len();
+
+                frames.push(frame);
+
+                ack_eliciting = true;
+                in_flight = true;
+            }
+
+            // Create MAX_STREAMS_UNI frame.
+            if self.streams.should_update_max_streams_uni() {
+                let max_streams = self.streams.update_max_streams_uni();
+                let frame = frame::Frame::MaxStreamsUni { max: max_streams };
+
+                payload_len += frame.wire_len();
+                left -= frame.wire_len();
+
+                frames.push(frame);
+
+                ack_eliciting = true;
+                in_flight = true;
+            }
+
             // Create MAX_DATA frame as needed.
             if self.should_update_max_data() {
                 let frame = frame::Frame::MaxData {
@@ -2423,6 +2446,8 @@ impl Connection {
         // If there are flushable streams, use Application.
         if self.handshake_completed &&
             (self.should_update_max_data() ||
+                self.streams.should_update_max_streams_bidi() ||
+                self.streams.should_update_max_streams_uni() ||
                 self.streams.has_flushable() ||
                 self.streams.has_almost_full())
         {
@@ -4402,6 +4427,99 @@ mod tests {
         assert!(r.next().is_some());
         assert!(r.next().is_some());
         assert!(r.next().is_none());
+    }
+
+    #[test]
+    /// Tests that the MAX_STREAMS frame is sent for bidirectional streams.
+    fn stream_limit_update_bidi() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+
+        assert_eq!(pipe.handshake(&mut buf), Ok(()));
+
+        // Client sends stream data.
+        assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(4, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(4, b"b", true), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(0, b"b", true), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        // Server reads stream data.
+        let mut b = [0; 15];
+        pipe.server.stream_recv(0, &mut b).unwrap();
+        pipe.server.stream_recv(4, &mut b).unwrap();
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        // Server sends stream data, with fin.
+        assert_eq!(pipe.server.stream_send(0, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.server.stream_send(4, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.server.stream_send(4, b"b", true), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.server.stream_send(0, b"b", true), Ok(1));
+
+        // Server sends MAX_STREAMS.
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        // Client tries to create new streams.
+        assert_eq!(pipe.client.stream_send(8, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(12, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.server.readable().len(), 2);
+    }
+
+    #[test]
+    /// Tests that the MAX_STREAMS frame is sent for unirectional streams.
+    fn stream_limit_update_uni() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+
+        assert_eq!(pipe.handshake(&mut buf), Ok(()));
+
+        // Client sends stream data.
+        assert_eq!(pipe.client.stream_send(2, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(6, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(6, b"b", true), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(2, b"b", true), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        // Server reads stream data.
+        let mut b = [0; 15];
+        pipe.server.stream_recv(2, &mut b).unwrap();
+        pipe.server.stream_recv(6, &mut b).unwrap();
+
+        // Server sends MAX_STREAMS.
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        // Client tries to create new streams.
+        assert_eq!(pipe.client.stream_send(10, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(14, b"a", false), Ok(1));
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        assert_eq!(pipe.server.readable().len(), 2);
     }
 }
 

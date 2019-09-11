@@ -54,9 +54,11 @@ pub struct StreamMap {
 
     /// Local maximum bidirectional stream count limit.
     local_max_streams_bidi: u64,
+    local_max_streams_bidi_next: u64,
 
     /// Local maximum unidirectional stream count limit.
     local_max_streams_uni: u64,
+    local_max_streams_uni_next: u64,
 
     /// Queue of stream IDs corresponding to streams that have buffered data
     /// ready to be sent to the peer. This also implies that the stream has
@@ -84,6 +86,18 @@ pub struct StreamMap {
 }
 
 impl StreamMap {
+    pub fn new(max_streams_bidi: u64, max_streams_uni: u64) -> StreamMap {
+        StreamMap {
+            local_max_streams_bidi: max_streams_bidi,
+            local_max_streams_bidi_next: max_streams_bidi,
+
+            local_max_streams_uni: max_streams_uni,
+            local_max_streams_uni_next: max_streams_uni,
+
+            ..StreamMap::default()
+        }
+    }
+
     /// Returns the stream with the given ID if it exists.
     pub fn get(&self, id: u64) -> Option<&Stream> {
         self.streams.get(&id)
@@ -236,16 +250,6 @@ impl StreamMap {
         }
     }
 
-    /// Updates the local maximum bidirectional stream count limit.
-    pub fn update_local_max_streams_bidi(&mut self, v: u64) {
-        self.local_max_streams_bidi = cmp::max(self.local_max_streams_bidi, v);
-    }
-
-    /// Updates the local maximum unidirectional stream count limit.
-    pub fn update_local_max_streams_uni(&mut self, v: u64) {
-        self.local_max_streams_uni = cmp::max(self.local_max_streams_uni, v);
-    }
-
     /// Updates the peer's maximum bidirectional stream count limit.
     pub fn update_peer_max_streams_bidi(&mut self, v: u64) {
         self.peer_max_streams_bidi = cmp::max(self.peer_max_streams_bidi, v);
@@ -256,12 +260,34 @@ impl StreamMap {
         self.peer_max_streams_uni = cmp::max(self.peer_max_streams_uni, v);
     }
 
+    /// Commits the new max_streams_bidi limit and returns it.
+    pub fn update_max_streams_bidi(&mut self) -> u64 {
+        self.local_max_streams_bidi = self.local_max_streams_bidi_next;
+        self.local_max_streams_bidi_next
+    }
+
+    /// Commits the new max_streams_uni limit and returns it.
+    pub fn update_max_streams_uni(&mut self) -> u64 {
+        self.local_max_streams_uni = self.local_max_streams_uni_next;
+        self.local_max_streams_uni_next
+    }
+
     /// Drops completed stream.
     ///
     /// This should only be called when Stream::is_complete() returns true for
     /// the given stream.
-    pub fn collect(&mut self, _stream_id: u64, _local: bool) {
-        // TODO: do something here
+    pub fn collect(&mut self, stream_id: u64, local: bool) {
+        if !local {
+            // If the stream was created by the peer, give back a max streams
+            // credit.
+            if is_bidi(stream_id) {
+                self.local_max_streams_bidi_next =
+                    self.local_max_streams_bidi_next.saturating_add(1);
+            } else {
+                self.local_max_streams_uni_next =
+                    self.local_max_streams_uni_next.saturating_add(1);
+            }
+        }
     }
 
     /// Creates an iterator over streams that have outstanding data to read.
@@ -288,6 +314,20 @@ impl StreamMap {
     /// flow control limit.
     pub fn has_almost_full(&self) -> bool {
         !self.almost_full.is_empty()
+    }
+
+    /// Returns true if the max bidirectional streams count needs to be updated
+    /// by sending a MAX_STREAMS frame to the peer.
+    pub fn should_update_max_streams_bidi(&self) -> bool {
+        self.local_max_streams_bidi_next != self.local_max_streams_bidi &&
+            self.local_max_streams_bidi_next / 2 > self.local_max_streams_bidi
+    }
+
+    /// Returns true if the max unidirectional streams count needs to be updated
+    /// by sending a MAX_STREAMS frame to the peer.
+    pub fn should_update_max_streams_uni(&self) -> bool {
+        self.local_max_streams_uni_next != self.local_max_streams_uni &&
+            self.local_max_streams_uni_next / 2 > self.local_max_streams_uni
     }
 
     /// Creates an iterator over all streams.
