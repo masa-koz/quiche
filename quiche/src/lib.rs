@@ -358,7 +358,7 @@ use std::cmp;
 use std::convert::TryInto;
 use std::time;
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, Ipv4Addr, Ipv6Addr, IpAddr};
 
 use std::pin::Pin;
 use std::str::FromStr;
@@ -575,6 +575,8 @@ pub enum QuicEvent {
 pub struct RecvInfo {
     /// The address the packet was received from.
     pub from: SocketAddr,
+    /// The address the packet was sent to.
+    pub to: SocketAddr,
 }
 
 /// Ancillary information about outgoing packets.
@@ -658,6 +660,8 @@ pub struct Config {
     max_stream_window: u64,
 
     events: bool,
+
+    local_addr: Option<SocketAddr>,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -715,6 +719,8 @@ impl Config {
             max_stream_window: stream::MAX_STREAM_WINDOW,
 
             events: false,
+
+            local_addr: None,
         })
     }
 
@@ -1080,6 +1086,13 @@ impl Config {
     pub fn enable_events(&mut self, v: bool) {
         self.events = v;
     }
+
+    /// Sets the initial local address.
+    /// 
+    /// the default value is 'None'
+    pub fn set_local_addr(&mut self, v: Option<SocketAddr>) {
+        self.local_addr = v;
+    }
 }
 
 /// A QUIC connection.
@@ -1114,7 +1127,7 @@ pub struct Connection {
     /// Loss recovery and congestion control state.
     recovery: recovery::Recovery,
 
-    peer_addr: SocketAddr,
+    path_mgmt: path::PathManagement,
 
     /// List of supported application protocols.
     application_protos: Vec<Vec<u8>>,
@@ -1218,9 +1231,6 @@ pub struct Connection {
 
     /// Whether the peer already updated its connection ID.
     got_peer_conn_id: bool,
-
-    /// Whether the peer's address has been verified.
-    verified_peer_address: bool,
 
     /// Whether the peer has verified our address.
     peer_verified_address: bool,
@@ -1545,6 +1555,7 @@ impl Connection {
             config.local_transport_params.active_conn_id_limit as usize,
             config.events,
         );
+        let mut path_mgmt = path::PathManagement::new();
         let reset_token = if is_server {
             config.local_transport_params.stateless_reset_token
         } else {
@@ -1554,6 +1565,23 @@ impl Connection {
         // XXX: We identify our only path as 0.
         let owned_scid = scid.clone().into_owned();
         ids.new_scid(owned_scid, reset_token, false, Some(0), false)?;
+
+        path_mgmt.add_peer_addr(peer)?;
+        let local_addr = if let Some(local_addr) = config.local_addr {
+            local_addr
+        } else {
+            if peer.is_ipv4() {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            } else {
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+            }
+        };
+        path_mgmt.add_local_addr(local_addr)?;
+
+        if odcid.is_some() {
+            // If we did stateless retry assume the peer's address is verified.
+            path_mgmt.verify_peer_addr(peer)?;
+        }
 
         let mut conn = Box::pin(Connection {
             version: config.version,
@@ -1578,7 +1606,7 @@ impl Connection {
 
             recovery: recovery::Recovery::new(config),
 
-            peer_addr: peer,
+            path_mgmt,
 
             application_protos: config.application_protos.clone(),
 
@@ -1643,9 +1671,6 @@ impl Connection {
             did_retry: false,
 
             got_peer_conn_id: false,
-
-            // If we did stateless retry assume the peer's address is verified.
-            verified_peer_address: odcid.is_some(),
 
             // Assume clients validate the server's address implicitly.
             peer_verified_address: is_server,
@@ -1911,7 +1936,7 @@ impl Connection {
         //
         // It doesn't matter if the packets received were valid or not, we only
         // need to track the total amount of bytes received.
-        if !self.verified_peer_address {
+        if !self.verified_peer_address()? {
             self.max_send_bytes += len * MAX_AMPLIFICATION_FACTOR;
         }
 
@@ -2520,7 +2545,7 @@ impl Connection {
         if self.is_server && hdr.ty == packet::Type::Handshake {
             self.drop_epoch_state(packet::EPOCH_INITIAL, now);
 
-            self.verified_peer_address = true;
+            self.path_mgmt.verify_peer_addr(info.from)?;
         }
 
         self.ack_eliciting_sent = false;
@@ -2635,7 +2660,7 @@ impl Connection {
 
         // Limit data sent by the server based on the amount of data received
         // from the client before its address is validated.
-        if !self.verified_peer_address && self.is_server {
+        if !self.verified_peer_address()? && self.is_server {
             left = cmp::min(left, self.max_send_bytes);
         }
 
@@ -2690,7 +2715,7 @@ impl Connection {
         }
 
         let info = SendInfo {
-            to: self.peer_addr,
+            to: self.peer_address()?,
 
             at: self.recovery.get_packet_send_time(),
         };
@@ -4846,6 +4871,18 @@ impl Connection {
         Ok(ConnectionId::from_ref(e.cid.as_ref()))
     }
 
+    #[inline]
+    pub fn peer_address(&self) -> Result<SocketAddr> {
+        let e = self.path_mgmt.default_path()?;
+        Ok(e.peer_addr)
+    }
+
+    #[inline]
+    pub fn verified_peer_address(&self) -> Result<bool> {
+        let e = self.path_mgmt.default_path()?;
+        Ok(e.verified_peer_addr)
+    }
+
     /// Returns the number of source Connection IDs that can still be provided
     /// to the peer without exceeding the limit it advertised.
     #[inline]
@@ -5252,7 +5289,7 @@ impl Connection {
     /// Processes an incoming frame.
     fn process_frame(
         &mut self, frame: frame::Frame, hdr: &packet::Header,
-        epoch: packet::Epoch, now: time::Instant,
+        epoch: packet::Epoch, now: time::Instant, info: &RecvInfo,
     ) -> Result<()> {
         trace!("{} rx frm {:?}", self.trace_id, frame);
 
@@ -5598,7 +5635,9 @@ impl Connection {
                 self.challenge = Some(data);
             },
 
-            frame::Frame::PathResponse { .. } => (),
+            frame::Frame::PathResponse { data } => {
+                self.path_mgmt.activate_path(info.from, info.to, Some(data));
+            },
 
             frame::Frame::ConnectionClose {
                 error_code, reason, ..
@@ -6547,7 +6586,7 @@ pub mod testing {
 
         pub fn client_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
             let info = RecvInfo {
-                from: self.client.peer_addr,
+                from: self.client.peer_address()?,
             };
 
             self.client.recv(buf, info)
@@ -6555,7 +6594,7 @@ pub mod testing {
 
         pub fn server_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
             let info = RecvInfo {
-                from: self.server.peer_addr,
+                from: self.server.peer_address()?,
             };
 
             self.server.recv(buf, info)
@@ -6574,7 +6613,7 @@ pub mod testing {
         conn: &mut Connection, buf: &mut [u8], len: usize,
     ) -> Result<usize> {
         let info = RecvInfo {
-            from: conn.peer_addr,
+            from: conn.peer_address()?,
         };
 
         conn.recv(&mut buf[..len], info)?;
@@ -6597,7 +6636,7 @@ pub mod testing {
     ) -> Result<()> {
         for mut pkt in flight {
             let info = RecvInfo {
-                from: conn.peer_addr,
+                from: conn.peer_address()?,
             };
 
             conn.recv(&mut pkt, info)?;
@@ -12036,6 +12075,7 @@ pub mod h3;
 mod minmax;
 mod octets;
 mod packet;
+mod path;
 mod rand;
 mod ranges;
 mod recovery;
