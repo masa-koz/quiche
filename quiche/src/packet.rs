@@ -814,21 +814,7 @@ fn compute_retry_integrity_tag(
         .map_err(|_| Error::CryptoFail)
 }
 
-pub struct PktNumSpace {
-    pub largest_rx_pkt_num: u64,
-
-    pub largest_rx_pkt_time: time::Instant,
-
-    pub largest_rx_non_probing_pkt_num: u64,
-
-    pub next_pkt_num: u64,
-
-    pub recv_pkt_need_ack: ranges::RangeSet,
-
-    pub recv_pkt_num: PktNumWindow,
-
-    pub ack_elicited: bool,
-
+pub struct CryptoCtx {
     pub crypto_open: Option<crypto::Open>,
     pub crypto_seal: Option<crypto::Seal>,
 
@@ -838,23 +824,9 @@ pub struct PktNumSpace {
     pub crypto_stream: stream::Stream,
 }
 
-impl PktNumSpace {
-    pub fn new() -> PktNumSpace {
-        PktNumSpace {
-            largest_rx_pkt_num: 0,
-
-            largest_rx_pkt_time: time::Instant::now(),
-
-            largest_rx_non_probing_pkt_num: 0,
-
-            next_pkt_num: 0,
-
-            recv_pkt_need_ack: ranges::RangeSet::new(crate::MAX_ACK_RANGES),
-
-            recv_pkt_num: PktNumWindow::default(),
-
-            ack_elicited: false,
-
+impl CryptoCtx {
+    pub fn new() -> CryptoCtx {
+        CryptoCtx {
             crypto_open: None,
             crypto_seal: None,
 
@@ -879,8 +851,6 @@ impl PktNumSpace {
             true,
             stream::MAX_STREAM_WINDOW,
         );
-
-        self.ack_elicited = false;
     }
 
     pub fn crypto_overhead(&self) -> Option<usize> {
@@ -888,11 +858,55 @@ impl PktNumSpace {
     }
 
     pub fn ready(&self) -> bool {
-        self.crypto_stream.is_flushable() || self.ack_elicited
+        self.crypto_stream.is_flushable()
     }
 
     pub fn has_keys(&self) -> bool {
         self.crypto_open.is_some() && self.crypto_seal.is_some()
+    }
+
+}
+pub struct PktNumSpace {
+    pub largest_rx_pkt_num: u64,
+
+    pub largest_rx_pkt_time: time::Instant,
+
+    pub largest_rx_non_probing_pkt_num: u64,
+
+    pub next_pkt_num: u64,
+
+    pub recv_pkt_need_ack: ranges::RangeSet,
+
+    pub recv_pkt_num: PktNumWindow,
+
+    pub ack_elicited: bool,
+}
+
+impl PktNumSpace {
+    pub fn new() -> PktNumSpace {
+        PktNumSpace {
+            largest_rx_pkt_num: 0,
+
+            largest_rx_pkt_time: time::Instant::now(),
+
+            largest_rx_non_probing_pkt_num: 0,
+
+            next_pkt_num: 0,
+
+            recv_pkt_need_ack: ranges::RangeSet::new(crate::MAX_ACK_RANGES),
+
+            recv_pkt_num: PktNumWindow::default(),
+
+            ack_elicited: false,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.ack_elicited = false;
+    }
+
+    pub fn ready(&self) -> bool {
+        self.ack_elicited
     }
 }
 
