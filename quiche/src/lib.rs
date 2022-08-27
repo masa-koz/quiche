@@ -1126,6 +1126,13 @@ impl Config {
     pub fn set_disable_dcid_reuse(&mut self, v: bool) {
         self.disable_dcid_reuse = v;
     }
+
+    /// Sets the `enable_multipath` transport parameter.
+    ///
+    /// The default value is `false`.
+    pub fn set_enable_multipath(&mut self, v: bool) {
+        self.local_transport_params.enable_multipath = v;
+    }
 }
 
 /// A QUIC connection.
@@ -1315,6 +1322,9 @@ pub struct Connection {
     /// Whether the connection should prevent from reusing destination
     /// Connection IDs when the peer migrates.
     disable_dcid_reuse: bool,
+
+    /// Whether the connection supports the multipath extension.
+    enable_multipath: bool,
 }
 
 /// Creates a new server-side connection.
@@ -1755,6 +1765,8 @@ impl Connection {
             emit_dgram: true,
 
             disable_dcid_reuse: config.disable_dcid_reuse,
+
+            enable_multipath: false,
         };
 
         if let Some(odcid) = odcid {
@@ -5884,6 +5896,9 @@ impl Connection {
         self.ids
             .set_source_conn_id_limit(peer_params.active_conn_id_limit);
 
+        self.enable_multipath = 
+            self.local_transport_params.enable_multipath && peer_params.enable_multipath;
+
         self.peer_transport_params = peer_params;
 
         Ok(())
@@ -7068,6 +7083,7 @@ struct TransportParams {
     pub initial_source_connection_id: Option<ConnectionId<'static>>,
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     pub max_datagram_frame_size: Option<u64>,
+    pub enable_multipath: bool,
 }
 
 impl Default for TransportParams {
@@ -7090,6 +7106,7 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            enable_multipath: false,
         }
     }
 }
@@ -7240,6 +7257,9 @@ impl TransportParams {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
                 },
 
+                0xbabf => {
+                    tp.enable_multipath = (val.get_u8()? & 0x1) == 0x1
+                },
                 // Ignore unknown parameters.
                 _ => (),
             }
@@ -7402,6 +7422,10 @@ impl TransportParams {
             b.put_varint(max_datagram_frame_size)?;
         }
 
+        if tp.enable_multipath {
+            TransportParams::encode_param(&mut b, 0xbabf, 1)?;
+            b.put_u8(0x1)?;
+        }
         let out_len = b.off();
 
         Ok(&mut out[..out_len])
@@ -7927,12 +7951,13 @@ mod tests {
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: Some(b"retry".to_vec().into()),
             max_datagram_frame_size: Some(32),
+            enable_multipath: true,
         };
 
         let mut raw_params = [42; 256];
         let raw_params =
             TransportParams::encode(&tp, true, &mut raw_params).unwrap();
-        assert_eq!(raw_params.len(), 94);
+        assert_eq!(raw_params.len(), 100);
 
         let new_tp = TransportParams::decode(raw_params, false).unwrap();
 
@@ -7957,12 +7982,13 @@ mod tests {
             initial_source_connection_id: Some(b"woot woot".to_vec().into()),
             retry_source_connection_id: None,
             max_datagram_frame_size: Some(32),
+            enable_multipath: true,
         };
 
         let mut raw_params = [42; 256];
         let raw_params =
             TransportParams::encode(&tp, false, &mut raw_params).unwrap();
-        assert_eq!(raw_params.len(), 69);
+        assert_eq!(raw_params.len(), 75);
 
         let new_tp = TransportParams::decode(raw_params, true).unwrap();
 
