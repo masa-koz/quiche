@@ -24,9 +24,13 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::BTreeMap;
+use std::convert::TryInto;
 use std::time;
 
 use ring::aead;
+
+use slab::Slab;
 
 use crate::Error;
 use crate::Result;
@@ -622,6 +626,28 @@ pub fn decrypt_pkt<'a>(
     Ok(b.get_bytes(payload_len)?)
 }
 
+pub fn decrypt_pkt_mp<'a>(
+    b: &'a mut octets::OctetsMut, scid_seq: u64, pn: u64, pn_len: usize, payload_len: usize,
+    aead: &crypto::Open,
+) -> Result<octets::Octets<'a>> {
+    let payload_offset = b.off();
+
+    let (header, mut payload) = b.split_at(payload_offset)?;
+
+    let payload_len = payload_len
+        .checked_sub(pn_len)
+        .ok_or(Error::InvalidPacket)?;
+
+    let mut ciphertext = payload.peek_bytes_mut(payload_len)?;
+
+    let scid_seq_u32: u32 = (scid_seq & 0xffffffff).try_into().unwrap();
+
+    let payload_len =
+        aead.open_with_96bit_counter(scid_seq_u32, pn, header.as_ref(), ciphertext.as_mut())?;
+
+    Ok(b.get_bytes(payload_len)?)
+}
+
 pub fn encrypt_hdr(
     b: &mut octets::OctetsMut, pn_len: usize, payload: &[u8], aead: &crypto::Seal,
 ) -> Result<()> {
@@ -654,6 +680,28 @@ pub fn encrypt_pkt(
     let (mut header, mut payload) = b.split_at(payload_offset)?;
 
     let ciphertext_len = aead.seal_with_u64_counter(
+        pn,
+        header.as_ref(),
+        payload.as_mut(),
+        payload_len,
+        extra_in,
+    )?;
+
+    encrypt_hdr(&mut header, pn_len, payload.as_ref(), aead)?;
+
+    Ok(payload_offset + ciphertext_len)
+}
+
+pub fn encrypt_pkt_mp(
+    b: &mut octets::OctetsMut, dcid_seq: u64, pn: u64, pn_len: usize, payload_len: usize,
+    payload_offset: usize, extra_in: Option<&[u8]>, aead: &crypto::Seal,
+) -> Result<usize> {
+    let (mut header, mut payload) = b.split_at(payload_offset)?;
+
+    let dcid_seq_u32: u32 = (dcid_seq & 0xffffffff).try_into().unwrap();
+
+    let ciphertext_len = aead.seal_with_96bit_counter(
+        dcid_seq_u32,
         pn,
         header.as_ref(),
         payload.as_mut(),
@@ -866,6 +914,117 @@ impl CryptoCtx {
     }
 
 }
+
+pub struct PktNumSpaces {
+    pkt_num_spaces: Slab<PktNumSpace>,
+
+    init_space_id: usize,
+
+    handshake_space_id: usize,
+
+    initial_app_space_id: usize,
+
+    dcid_to_spaces: BTreeMap<u64, usize>,
+
+    scid_to_spaces: BTreeMap<u64, usize>,
+
+    pub multi_spaces: bool,
+}
+
+impl PktNumSpaces {
+    pub fn new() -> PktNumSpaces {
+        let mut pkt_num_spaces = Slab::with_capacity(3);
+        let mut dcid_to_spaces = BTreeMap::new();
+        let mut scid_to_spaces = BTreeMap::new();
+
+        let init_space_id = pkt_num_spaces.insert(PktNumSpace::new(None, None));
+        let handshake_space_id = pkt_num_spaces.insert(PktNumSpace::new(None, None));
+        let initial_app_space_id = pkt_num_spaces.insert(PktNumSpace::new(Some(0), Some(0)));
+
+        dcid_to_spaces.insert(0, initial_app_space_id);
+        scid_to_spaces.insert(0, initial_app_space_id);
+ 
+        PktNumSpaces {
+            pkt_num_spaces,
+            init_space_id,
+            handshake_space_id,
+            initial_app_space_id,
+            dcid_to_spaces,
+            scid_to_spaces,
+            multi_spaces: false,
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, space_id: usize) -> Result<&PktNumSpace> {
+        self.pkt_num_spaces.get(space_id).ok_or(Error::InvalidState)
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, space_id: usize) -> Result<&mut PktNumSpace> {
+        self.pkt_num_spaces.get_mut(space_id).ok_or(Error::InvalidState)
+    }
+
+    #[inline]
+    pub fn get_space_id(&self, epoch: usize, cid_seq: Option<u64>, sender: bool) -> Result<usize> {
+        match epoch {
+            EPOCH_INITIAL => {
+                Ok(self.init_space_id)
+            }
+            EPOCH_HANDSHAKE => {
+                Ok(self.handshake_space_id)
+            }
+            EPOCH_APPLICATION => {
+                if self.multi_spaces && cid_seq.is_some() {
+                    if sender {
+                        self.dcid_to_spaces.get(&cid_seq.unwrap()).copied().ok_or(Error::InvalidState)
+                    } else {
+                        self.scid_to_spaces.get(&cid_seq.unwrap()).copied().ok_or(Error::InvalidState)
+                    }
+                } else {
+                    Ok(self.initial_app_space_id)
+                }
+            }
+            _ => unreachable!()
+        }
+    }
+
+    pub fn insert_space(&mut self, space: PktNumSpace) -> Result<usize> {
+        if !self.multi_spaces {
+            return Err(Error::InvalidState);
+        }
+
+        let dcid_seq = space.dcid_seq.clone();
+        let scid_seq = space.scid_seq.clone();
+
+        let space_id = self.pkt_num_spaces.insert(space);
+
+        if let Some(dcid_seq) = dcid_seq {
+            self.dcid_to_spaces.insert(dcid_seq, space_id);
+        }
+        if let Some(scid_seq) = scid_seq {
+            self.scid_to_spaces.insert(scid_seq, space_id);
+        }
+
+        Ok(space_id)
+    }
+
+    pub fn link_space_to_dcid_seq(&mut self, space_id: usize, dcid_seq: u64) -> Result<()> {
+        let e = self.pkt_num_spaces.get_mut(space_id).ok_or(Error::InvalidState)?;
+        e.dcid_seq = Some(dcid_seq);
+        self.dcid_to_spaces.insert(dcid_seq, space_id);
+        Ok(())
+    }
+
+    pub fn link_space_to_scid_seq(&mut self, space_id: usize, scid_seq: u64) -> Result<()> {
+        let e = self.pkt_num_spaces.get_mut(space_id).ok_or(Error::InvalidState)?;
+        e.scid_seq = Some(scid_seq);
+        self.scid_to_spaces.insert(scid_seq, space_id);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub struct PktNumSpace {
     pub largest_rx_pkt_num: u64,
 
@@ -880,10 +1039,14 @@ pub struct PktNumSpace {
     pub recv_pkt_num: PktNumWindow,
 
     pub ack_elicited: bool,
+
+    pub dcid_seq: Option<u64>,
+
+    pub scid_seq: Option<u64>,
 }
 
 impl PktNumSpace {
-    pub fn new() -> PktNumSpace {
+    pub fn new(dcid_seq: Option<u64>, scid_seq: Option<u64>) -> PktNumSpace {
         PktNumSpace {
             largest_rx_pkt_num: 0,
 
@@ -898,6 +1061,10 @@ impl PktNumSpace {
             recv_pkt_num: PktNumWindow::default(),
 
             ack_elicited: false,
+
+            dcid_seq,
+
+            scid_seq,
         }
     }
 
@@ -910,7 +1077,7 @@ impl PktNumSpace {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct PktNumWindow {
     lower: u64,
     window: u128,

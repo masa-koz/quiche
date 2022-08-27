@@ -63,6 +63,7 @@ pub enum Frame {
     Ping,
 
     ACK {
+        pkt_num_space_id: Option<u64>,
         ack_delay: u64,
         ranges: ranges::RangeSet,
         ecn_counts: Option<EcnCounts>,
@@ -200,7 +201,7 @@ impl Frame {
 
             0x01 => Frame::Ping,
 
-            0x02..=0x03 => parse_ack_frame(frame_type, b)?,
+            0x02..=0x03 => parse_ack_frame(frame_type, false, b)?,
 
             0x04 => Frame::ResetStream {
                 stream_id: b.get_varint()?,
@@ -307,6 +308,8 @@ impl Frame {
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
 
+            0xbaba00..=0xbaba01 => parse_ack_frame(frame_type, true, b)?,
+
             _ => return Err(Error::InvalidFrame),
         };
 
@@ -364,16 +367,26 @@ impl Frame {
             },
 
             Frame::ACK {
+                pkt_num_space_id,
                 ack_delay,
                 ranges,
                 ecn_counts,
             } => {
-                if ecn_counts.is_none() {
-                    b.put_varint(0x02)?;
+                if let Some(pkt_num_space_id) = pkt_num_space_id {
+                    if ecn_counts.is_none() {
+                        b.put_varint(0xbaba00)?;
+                    } else {
+                        b.put_varint(0xbaba01)?;
+                    }
+                    b.put_varint(*pkt_num_space_id)?;
                 } else {
-                    b.put_varint(0x03)?;
+                    if ecn_counts.is_none() {
+                        b.put_varint(0x02)?;
+                    } else {
+                        b.put_varint(0x03)?;
+                    }
                 }
-
+    
                 let mut it = ranges.iter().rev();
 
                 let first = it.next().unwrap();
@@ -581,6 +594,7 @@ impl Frame {
             Frame::Ping => 1,
 
             Frame::ACK {
+                pkt_num_space_id,
                 ack_delay,
                 ranges,
                 ecn_counts,
@@ -590,8 +604,13 @@ impl Frame {
                 let first = it.next().unwrap();
                 let ack_block = (first.end - 1) - first.start;
 
-                let mut len = 1 + // frame type
-                    octets::varint_len(first.end - 1) + // largest_ack
+                let mut len = if let Some(pkt_num_space_id) = pkt_num_space_id {
+                    4 + // frame type
+                        octets::varint_len(*pkt_num_space_id) // pkt_num_space_id
+                } else {
+                    1 // frame type
+                };
+                len += octets::varint_len(first.end - 1) + // largest_ack
                     octets::varint_len(*ack_delay) + // ack_delay
                     octets::varint_len(it.len() as u64) + // block_count
                     octets::varint_len(ack_block); // first_block
@@ -819,6 +838,7 @@ impl Frame {
                 ack_delay,
                 ranges,
                 ecn_counts,
+                ..
             } => {
                 let ack_ranges = AckedRanges::Double(
                     ranges.iter().map(|r| (r.start, r.end - 1)).collect(),
@@ -1009,15 +1029,25 @@ impl std::fmt::Debug for Frame {
             },
 
             Frame::ACK {
+                pkt_num_space_id,
                 ack_delay,
                 ranges,
                 ecn_counts,
             } => {
-                write!(
-                    f,
-                    "ACK delay={} blocks={:?} ecn_counts={:?}",
-                    ack_delay, ranges, ecn_counts
-                )?;
+                if let Some(pkt_num_space_id) = pkt_num_space_id {
+                    write!(
+                        f,
+                        "ACK_MP pkt_num_space_id={} delay={} blocks={:?} ecn_counts={:?}",
+                        pkt_num_space_id, ack_delay, ranges, ecn_counts
+                    )?;
+    
+                } else {
+                    write!(
+                        f,
+                        "ACK delay={} blocks={:?} ecn_counts={:?}",
+                        ack_delay, ranges, ecn_counts
+                    )?;    
+                }
             },
 
             Frame::ResetStream {
@@ -1177,9 +1207,14 @@ impl std::fmt::Debug for Frame {
     }
 }
 
-fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
+fn parse_ack_frame(ty: u64, is_mp: bool, b: &mut octets::Octets) -> Result<Frame> {
     let first = ty as u8;
 
+    let pkt_num_space_id = if is_mp {
+        b.get_varint()?
+    } else {
+        0
+    };
     let largest_ack = b.get_varint()?;
     let ack_delay = b.get_varint()?;
     let block_count = b.get_varint()?;
@@ -1226,11 +1261,21 @@ fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
         None
     };
 
-    Ok(Frame::ACK {
-        ack_delay,
-        ranges,
-        ecn_counts,
-    })
+    if is_mp {
+        Ok(Frame::ACK {
+            pkt_num_space_id: Some(pkt_num_space_id),
+            ack_delay,
+            ranges,
+            ecn_counts,
+        })
+    } else {
+        Ok(Frame::ACK {
+            pkt_num_space_id: None,
+            ack_delay,
+            ranges,
+            ecn_counts,
+        })    
+    }
 }
 
 pub fn encode_crypto_header(
@@ -1400,6 +1445,7 @@ mod tests {
         ranges.insert(3000..5000);
 
         let frame = Frame::ACK {
+            pkt_num_space_id: None,
             ack_delay: 874_656_534,
             ranges,
             ecn_counts: None,
@@ -1442,6 +1488,7 @@ mod tests {
         });
 
         let frame = Frame::ACK {
+            pkt_num_space_id: None,
             ack_delay: 874_656_534,
             ranges,
             ecn_counts,
@@ -1453,6 +1500,86 @@ mod tests {
         };
 
         assert_eq!(wire_len, 23);
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Initial).is_ok());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::ZeroRTT).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_ok());
+    }
+
+    #[test]
+    fn ack_mp() {
+        let mut d = [42; 128];
+
+        let mut ranges = ranges::RangeSet::default();
+        ranges.insert(4..7);
+        ranges.insert(9..12);
+        ranges.insert(15..19);
+        ranges.insert(3000..5000);
+
+        let frame = Frame::ACK {
+            pkt_num_space_id: Some(1),
+            ack_delay: 874_656_534,
+            ranges,
+            ecn_counts: None,
+        };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, 21);
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Initial).is_ok());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::ZeroRTT).is_err());
+
+        let mut b = octets::Octets::with_slice(&d);
+        assert!(Frame::from_bytes(&mut b, packet::Type::Handshake).is_ok());
+    }
+
+    #[test]
+    fn ack_mp_ecn() {
+        let mut d = [42; 128];
+
+        let mut ranges = ranges::RangeSet::default();
+        ranges.insert(4..7);
+        ranges.insert(9..12);
+        ranges.insert(15..19);
+        ranges.insert(3000..5000);
+
+        let ecn_counts = Some(EcnCounts {
+            ect0_count: 100,
+            ect1_count: 200,
+            ecn_ce_count: 300,
+        });
+
+        let frame = Frame::ACK {
+            pkt_num_space_id: Some(1),
+            ack_delay: 874_656_534,
+            ranges,
+            ecn_counts,
+        };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, 27);
 
         let mut b = octets::Octets::with_slice(&d);
         assert_eq!(Frame::from_bytes(&mut b, packet::Type::Short), Ok(frame));

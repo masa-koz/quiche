@@ -1150,7 +1150,7 @@ pub struct Connection {
     crypto_ctxs: [packet::CryptoCtx; packet::EPOCH_COUNT],
 
     /// Packet number spaces.
-    pkt_num_spaces: [packet::PktNumSpace; packet::EPOCH_COUNT],
+    pkt_num_spaces: packet::PktNumSpaces,
 
     /// Peer's transport parameters.
     peer_transport_params: TransportParams,
@@ -1649,11 +1649,7 @@ impl Connection {
                 packet::CryptoCtx::new(),
             ],
 
-            pkt_num_spaces: [
-                packet::PktNumSpace::new(),
-                packet::PktNumSpace::new(),
-                packet::PktNumSpace::new(),
-            ],
+            pkt_num_spaces: packet::PktNumSpaces::new(),
 
             peer_transport_params: TransportParams::default(),
 
@@ -2340,6 +2336,14 @@ impl Connection {
         // Select packet number space epoch based on the received packet's type.
         let epoch = hdr.ty.to_epoch()?;
 
+        let space_id = if epoch == packet::EPOCH_APPLICATION {
+            self.get_or_create_space_id(hdr.ty, &hdr.dcid, recv_pid)
+        } else {
+            self.pkt_num_spaces.get_space_id(epoch, None, false)
+        }.map_err(|e| {
+            drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
+        })?;
+
         // Select AEAD context used to open incoming packet.
         let aead = if hdr.ty == packet::Type::ZeroRTT {
             // Only use 0-RTT key if incoming packet is 0-RTT.
@@ -2387,8 +2391,9 @@ impl Connection {
             drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
         })?;
 
+
         let pn = packet::decode_pkt_num(
-            self.pkt_num_spaces[epoch].largest_rx_pkt_num,
+            self.pkt_num_spaces.get(space_id)?.largest_rx_pkt_num,
             hdr.pkt_num,
             hdr.pkt_num_len,
         );
@@ -2407,21 +2412,36 @@ impl Connection {
         #[cfg(feature = "qlog")]
         let mut qlog_frames = vec![];
 
-        let mut payload = packet::decrypt_pkt(
-            &mut b,
-            pn,
-            pn_len,
-            payload_len,
-            aead,
-        )
-        .map_err(|e| {
-            drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
-        })?;
+        let mut payload = if self.pkt_num_spaces.multi_spaces && epoch == packet::EPOCH_APPLICATION {
+            let scid_seq = self.pkt_num_spaces.get(space_id)?.scid_seq.ok_or(Error::InvalidState)?;
+            packet::decrypt_pkt_mp(
+                &mut b,
+                scid_seq,
+                pn,
+                pn_len,
+                payload_len,
+                aead,
+            )
+            .map_err(|e| {
+                drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
+            })?
+        } else {
+            packet::decrypt_pkt(
+                &mut b,
+                pn,
+                pn_len,
+                payload_len,
+                aead,
+            )
+            .map_err(|e| {
+                drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
+            })?
+        };
 
-        if self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn) {
+        if self.pkt_num_spaces.get_mut(space_id)?.recv_pkt_num.contains(pn) {
             trace!("{} ignored duplicate packet {}", self.trace_id, pn);
             return Err(Error::Done);
-        }
+        }    
 
         // Packets with no frames are invalid.
         if payload.cap() == 0 {
@@ -2574,12 +2594,13 @@ impl Connection {
         for (_, p) in self.paths.iter_mut() {
             for acked in p.recovery.acked[epoch].drain(..) {
                 match acked {
-                    frame::Frame::ACK { ranges, .. } => {
+                    frame::Frame::ACK { pkt_num_space_id, ranges, .. } => {
+                        let ack_space_id = self.pkt_num_spaces.get_space_id(epoch, Some(pkt_num_space_id.unwrap_or(0)), false)?;
                         // Stop acknowledging packets less than or equal to the
                         // largest acknowledged in the sent ACK frame that, in
                         // turn, got acked.
                         if let Some(largest_acked) = ranges.last() {
-                            self.pkt_num_spaces[epoch]
+                            self.pkt_num_spaces.get_mut(ack_space_id)?
                                 .recv_pkt_need_ack
                                 .remove_until(largest_acked);
                         }
@@ -2662,6 +2683,11 @@ impl Connection {
                 None => break,
             };
 
+            if self.pkt_num_spaces.multi_spaces {
+                let scid_seq = p.active_scid_seq.ok_or(Error::InvalidState)?;
+                let space_id = self.pkt_num_spaces.get_space_id(epoch, Some(scid_seq), false)?;
+                self.pkt_num_spaces.link_space_to_dcid_seq(space_id, dcid_seq)?;
+            }
             self.ids.link_dcid_to_path_id(dcid_seq, pid)?;
 
             p.active_dcid_seq = Some(dcid_seq);
@@ -2669,23 +2695,23 @@ impl Connection {
 
         // We only record the time of arrival of the largest packet number
         // that still needs to be acked, to be used for ACK delay calculation.
-        if self.pkt_num_spaces[epoch].recv_pkt_need_ack.last() < Some(pn) {
-            self.pkt_num_spaces[epoch].largest_rx_pkt_time = now;
+        if self.pkt_num_spaces.get(space_id)?.recv_pkt_need_ack.last() < Some(pn) {
+            self.pkt_num_spaces.get_mut(space_id)?.largest_rx_pkt_time = now;
         }
 
-        self.pkt_num_spaces[epoch].recv_pkt_num.insert(pn);
+        self.pkt_num_spaces.get_mut(space_id)?.recv_pkt_num.insert(pn);
 
-        self.pkt_num_spaces[epoch].recv_pkt_need_ack.push_item(pn);
+        self.pkt_num_spaces.get_mut(space_id)?.recv_pkt_need_ack.push_item(pn);
 
-        self.pkt_num_spaces[epoch].ack_elicited =
-            cmp::max(self.pkt_num_spaces[epoch].ack_elicited, ack_elicited);
+        self.pkt_num_spaces.get_mut(space_id)?.ack_elicited =
+            cmp::max(self.pkt_num_spaces.get(space_id)?.ack_elicited, ack_elicited);
 
-        self.pkt_num_spaces[epoch].largest_rx_pkt_num =
-            cmp::max(self.pkt_num_spaces[epoch].largest_rx_pkt_num, pn);
+        self.pkt_num_spaces.get_mut(space_id)?.largest_rx_pkt_num =
+            cmp::max(self.pkt_num_spaces.get(space_id)?.largest_rx_pkt_num, pn);
 
         if !probing {
-            self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num = cmp::max(
-                self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num,
+            self.pkt_num_spaces.get_mut(space_id)?.largest_rx_non_probing_pkt_num = cmp::max(
+                self.pkt_num_spaces.get(space_id)?.largest_rx_non_probing_pkt_num,
                 pn,
             );
 
@@ -2694,7 +2720,7 @@ impl Connection {
 
             if self.is_server &&
                 recv_pid != active_path_id &&
-                self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num == pn
+                self.pkt_num_spaces.get(space_id)?.largest_rx_non_probing_pkt_num == pn
             {
                 self.paths
                     .on_peer_migrated(recv_pid, self.disable_dcid_reuse)?;
@@ -3043,6 +3069,14 @@ impl Connection {
 
         let epoch = pkt_type.to_epoch()?;
 
+        let dcid_seq = self
+            .paths
+            .get(send_pid)?
+            .active_dcid_seq
+            .ok_or(Error::OutOfIdentifiers)?;
+
+        let space_id = self.pkt_num_spaces.get_space_id(epoch, Some(dcid_seq), true)?;
+
         // Process lost frames. There might be several paths having lost frames.
         for (_, p) in self.paths.iter_mut() {
             for lost in p.recovery.lost[epoch].drain(..) {
@@ -3103,8 +3137,9 @@ impl Connection {
                         p.retrans_count += 1;
                     },
 
-                    frame::Frame::ACK { .. } => {
-                        self.pkt_num_spaces[epoch].ack_elicited = true;
+                    frame::Frame::ACK { pkt_num_space_id, .. } => {
+                        let ack_space_id = self.pkt_num_spaces.get_space_id(epoch, Some(pkt_num_space_id.unwrap_or(0)), false)?;
+                        self.pkt_num_spaces.get_mut(ack_space_id)?.ack_elicited = true;
                     },
 
                     frame::Frame::ResetStream {
@@ -3153,19 +3188,13 @@ impl Connection {
         left =
             cmp::min(left, self.paths.get(send_pid)?.recovery.cwnd_available());
 
-        let pn = self.pkt_num_spaces[epoch].next_pkt_num;
+        let pn = self.pkt_num_spaces.get(space_id)?.next_pkt_num;
         let pn_len = packet::pkt_num_len(pn)?;
 
         // The AEAD overhead at the current encryption level.
         let crypto_overhead = self.crypto_ctxs[epoch]
             .crypto_overhead()
             .ok_or(Error::Done)?;
-
-        let dcid_seq = self
-            .paths
-            .get(send_pid)?
-            .active_dcid_seq
-            .ok_or(Error::OutOfIdentifiers)?;
 
         let dcid =
             ConnectionId::from_ref(self.ids.get_dcid(dcid_seq)?.cid.as_ref());
@@ -3317,27 +3346,38 @@ impl Connection {
         }
 
         // Create ACK frame.
-        if self.pkt_num_spaces[epoch].recv_pkt_need_ack.len() > 0 &&
-            (self.pkt_num_spaces[epoch].ack_elicited ||
+        if self.pkt_num_spaces.get(space_id)?.recv_pkt_need_ack.len() > 0 &&
+            (self.pkt_num_spaces.get(space_id)?.ack_elicited ||
                 self.paths.get(send_pid)?.recovery.loss_probes[epoch] > 0) &&
             !is_closing &&
             self.paths.get(send_pid)?.active()
         {
             let ack_delay =
-                self.pkt_num_spaces[epoch].largest_rx_pkt_time.elapsed();
+                self.pkt_num_spaces.get(space_id)?.largest_rx_pkt_time.elapsed();
 
             let ack_delay = ack_delay.as_micros() as u64 /
                 2_u64
                     .pow(self.local_transport_params.ack_delay_exponent as u32);
 
+            let pkt_num_space_id = if self.enable_multipath && epoch == packet::EPOCH_APPLICATION{
+                let scid_seq = self
+                    .paths
+                    .get(send_pid)?
+                    .active_scid_seq
+                    .ok_or(Error::OutOfIdentifiers)?;
+                Some(scid_seq)
+            } else {
+                None
+            };
             let frame = frame::Frame::ACK {
+                pkt_num_space_id,
                 ack_delay,
-                ranges: self.pkt_num_spaces[epoch].recv_pkt_need_ack.clone(),
+                ranges: self.pkt_num_spaces.get(space_id)?.recv_pkt_need_ack.clone(),
                 ecn_counts: None, // sending ECN is not supported at this time
             };
 
             if push_frame_to_pkt!(b, frames, frame, left) {
-                self.pkt_num_spaces[epoch].ack_elicited = false;
+                self.pkt_num_spaces.get_mut(space_id)?.ack_elicited = false;
             }
         }
 
@@ -4007,15 +4047,28 @@ impl Connection {
             None => return Err(Error::InvalidState),
         };
 
-        let written = packet::encrypt_pkt(
-            &mut b,
-            pn,
-            pn_len,
-            payload_len,
-            payload_offset,
-            None,
-            aead,
-        )?;
+        let written = if self.pkt_num_spaces.multi_spaces && epoch == packet::EPOCH_APPLICATION && dcid_seq > 0 {
+            packet::encrypt_pkt_mp(
+                &mut b,
+                dcid_seq,
+                pn,
+                pn_len,
+                payload_len,
+                payload_offset,
+                None,
+                aead,
+            )?
+        } else {
+            packet::encrypt_pkt(
+                &mut b,
+                pn,
+                pn_len,
+                payload_len,
+                payload_offset,
+                None,
+                aead,
+            )?
+        };
 
         let sent_pkt = recovery::Sent {
             pkt_num: pn,
@@ -4063,7 +4116,7 @@ impl Connection {
             self.paths.on_challenge_sent(send_pid, data, written, now)?;
         }
 
-        self.pkt_num_spaces[epoch].next_pkt_num += 1;
+        self.pkt_num_spaces.get_mut(space_id)?.next_pkt_num += 1;
 
         self.sent_count += 1;
         self.sent_bytes += written as u64;
@@ -5899,6 +5952,10 @@ impl Connection {
         self.enable_multipath = 
             self.local_transport_params.enable_multipath && peer_params.enable_multipath;
 
+        if !self.ids.zero_length_dcid() && !self.ids.zero_length_scid() && self.enable_multipath {
+            self.pkt_num_spaces.multi_spaces = true;
+        }
+
         self.peer_transport_params = peer_params;
 
         Ok(())
@@ -6009,14 +6066,22 @@ impl Connection {
             return Ok(packet::Type::from_epoch(epoch));
         }
 
+        let dcid_seq = self
+            .paths
+            .get(send_pid)?
+            .active_dcid_seq
+            .ok_or(Error::OutOfIdentifiers)?;
+
         for epoch in packet::EPOCH_INITIAL..packet::EPOCH_COUNT {
+            let space_id = self.pkt_num_spaces.get_space_id(epoch, Some(dcid_seq), true)?;
+
             // Only send packets in a space when we have the send keys for it.
             if self.crypto_ctxs[epoch].crypto_seal.is_none() {
                 continue;
             }
 
             // We are ready to send data for this packet number space.
-            if self.crypto_ctxs[epoch].ready() || self.pkt_num_spaces[epoch].ready() {
+            if self.crypto_ctxs[epoch].ready() || self.pkt_num_spaces.get(space_id)?.ready() {
                 return Ok(packet::Type::from_epoch(epoch));
             }
 
@@ -6536,7 +6601,9 @@ impl Connection {
         self.crypto_ctxs[epoch].crypto_open = None;
         self.crypto_ctxs[epoch].crypto_seal = None;
         self.crypto_ctxs[epoch].clear();
-        self.pkt_num_spaces[epoch].clear();
+
+        let space_id = self.pkt_num_spaces.get_space_id(epoch, None, true).unwrap();
+        self.pkt_num_spaces.get_mut(space_id).unwrap().clear();
 
         let handshake_status = self.handshake_status();
         for (_, p) in self.paths.iter_mut() {
@@ -6664,7 +6731,6 @@ impl Connection {
     ) -> Result<()> {
         self.ids.set_initial_dcid(cid, reset_token, Some(path_id));
         self.paths.get_mut(path_id)?.active_dcid_seq = Some(0);
-
         Ok(())
     }
 
@@ -6835,6 +6901,10 @@ impl Connection {
                 .ok_or(Error::OutOfIdentifiers)?
         };
 
+        if self.pkt_num_spaces.multi_spaces {
+            self.pkt_num_spaces.insert_space(packet::PktNumSpace::new(Some(dcid_seq), None))?;
+        }
+
         let mut path =
             path::Path::new(local_addr, peer_addr, &self.recovery_config, false);
         path.active_dcid_seq = Some(dcid_seq);
@@ -6846,6 +6916,35 @@ impl Connection {
         self.ids.link_dcid_to_path_id(dcid_seq, pid)?;
 
         Ok(pid)
+    }
+
+    fn get_or_create_space_id(&mut self, ty: packet::Type, dcid: &ConnectionId,
+        recv_pid: Option<usize>,
+    ) -> Result<usize> {
+        if !self.pkt_num_spaces.multi_spaces {
+            return self.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, None, false);
+        }
+
+        let scid_seq = self.ids.find_scid_seq(dcid).map(|(seq, _)| seq);
+        if scid_seq.is_none() && ty != packet::Type::ZeroRTT {
+            return Err(Error::Done);
+        }
+
+        let mut space_id = self.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, scid_seq, false);
+
+        if space_id.is_err() && scid_seq.is_some() {
+            if recv_pid.is_some() {
+                let dcid_seq = self.paths.get(recv_pid.unwrap())?.active_dcid_seq.ok_or(Error::InvalidState)?;
+                space_id = self.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(dcid_seq), true);
+                if space_id.is_ok() {
+                    self.pkt_num_spaces.link_space_to_scid_seq(space_id.unwrap(), scid_seq.unwrap())?;
+                }
+            } else {
+                space_id = self.pkt_num_spaces.insert_space(packet::PktNumSpace::new(None, scid_seq));
+            }
+        }
+
+        space_id
     }
 }
 
@@ -7806,10 +7905,6 @@ pub mod testing {
         let epoch = pkt_type.to_epoch()?;
 
         let ctx = &mut conn.crypto_ctxs[epoch];
-        let space = &mut conn.pkt_num_spaces[epoch];
-
-        let pn = space.next_pkt_num;
-        let pn_len = 4;
 
         let send_path = conn.paths.get_active()?;
         let active_dcid_seq = send_path
@@ -7820,6 +7915,12 @@ pub mod testing {
             .active_scid_seq
             .as_ref()
             .ok_or(Error::InvalidState)?;
+
+        let space_id = conn.pkt_num_spaces.get_space_id(epoch, Some(*active_dcid_seq), true)?;
+        let space = conn.pkt_num_spaces.get_mut(space_id)?;
+
+        let pn = space.next_pkt_num;
+        let pn_len = 4;
 
         let hdr = Header {
             ty: pkt_type,
@@ -7885,6 +7986,10 @@ pub mod testing {
 
         let epoch = hdr.ty.to_epoch()?;
 
+        let scid_seq =
+            conn.ids.find_scid_seq(&hdr.dcid).map(|(seq, _)| seq);
+        let space_id = conn.pkt_num_spaces.get_space_id(epoch, scid_seq, false)?;
+
         let aead = conn.crypto_ctxs[epoch].crypto_open.as_ref().unwrap();
 
         let payload_len = b.cap();
@@ -7892,7 +7997,7 @@ pub mod testing {
         packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
 
         let pn = packet::decode_pkt_num(
-            conn.pkt_num_spaces[epoch].largest_rx_pkt_num,
+            conn.pkt_num_spaces.get(space_id)?.largest_rx_pkt_num,
             hdr.pkt_num,
             hdr.pkt_num_len,
         );
@@ -9588,12 +9693,14 @@ mod tests {
 
         assert!(!pipe.server.is_established());
 
+        let space_id = pipe.server.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(0), true).unwrap();
+
         // Client sent 1-RTT packets 0 and 1, but server hasn't received them.
         //
         // Note that `largest_rx_pkt_num` is initialized to 0, so we need to
         // send another 1-RTT packet to make this check meaningful.
         assert_eq!(
-            pipe.server.pkt_num_spaces[packet::EPOCH_APPLICATION]
+            pipe.server.pkt_num_spaces.get(space_id).unwrap()
                 .largest_rx_pkt_num,
             0
         );
@@ -9604,7 +9711,7 @@ mod tests {
         assert!(pipe.server.is_established());
 
         assert_eq!(
-            pipe.server.pkt_num_spaces[packet::EPOCH_APPLICATION]
+            pipe.server.pkt_num_spaces.get(space_id).unwrap()
                 .largest_rx_pkt_num,
             0
         );
@@ -9696,6 +9803,7 @@ mod tests {
         ranges.insert(0..6);
 
         let frames = [frame::Frame::ACK {
+            pkt_num_space_id: None,
             ack_delay: 15,
             ranges,
             ecn_counts: None,
@@ -11553,7 +11661,10 @@ mod tests {
 
         let epoch = packet::EPOCH_APPLICATION;
 
-        assert_eq!(pipe.server.pkt_num_spaces[epoch].recv_pkt_need_ack.len(), 0);
+        let server_space_id = pipe.server.pkt_num_spaces.get_space_id(epoch, Some(0), false).unwrap();
+        let client_space_id = pipe.client.pkt_num_spaces.get_space_id(epoch, Some(0), false).unwrap();
+
+        assert_eq!(pipe.server.pkt_num_spaces.get(server_space_id).unwrap().recv_pkt_need_ack.len(), 0);
 
         let frames = [frame::Frame::Ping, frame::Frame::Padding { len: 3 }];
 
@@ -11564,7 +11675,7 @@ mod tests {
         for _ in 0..512 {
             let recv_count = pipe.server.recv_count;
 
-            last_packet_sent = pipe.client.pkt_num_spaces[epoch].next_pkt_num;
+            last_packet_sent = pipe.client.pkt_num_spaces.get(client_space_id).unwrap().next_pkt_num;
 
             pipe.send_pkt_to_server(pkt_type, &frames, &mut buf)
                 .unwrap();
@@ -11572,21 +11683,21 @@ mod tests {
             assert_eq!(pipe.server.recv_count, recv_count + 1);
 
             // Skip packet number.
-            pipe.client.pkt_num_spaces[epoch].next_pkt_num += 1;
+            pipe.client.pkt_num_spaces.get_mut(client_space_id).unwrap().next_pkt_num += 1;
         }
 
         assert_eq!(
-            pipe.server.pkt_num_spaces[epoch].recv_pkt_need_ack.len(),
+            pipe.server.pkt_num_spaces.get(server_space_id).unwrap().recv_pkt_need_ack.len(),
             MAX_ACK_RANGES
         );
 
         assert_eq!(
-            pipe.server.pkt_num_spaces[epoch].recv_pkt_need_ack.first(),
+            pipe.server.pkt_num_spaces.get(server_space_id).unwrap().recv_pkt_need_ack.first(),
             Some(last_packet_sent - ((MAX_ACK_RANGES as u64) - 1) * 2)
         );
 
         assert_eq!(
-            pipe.server.pkt_num_spaces[epoch].recv_pkt_need_ack.last(),
+            pipe.server.pkt_num_spaces.get(server_space_id).unwrap().recv_pkt_need_ack.last(),
             Some(last_packet_sent)
         );
     }
@@ -14048,6 +14159,7 @@ mod tests {
         // then migrates.
         assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
         assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(pipe.client.paths.iter().filter(|(_, p)| p.active_dcid_seq == Some(1)).map(|(_, p)| p.active_scid_seq).next(), Some(Some(1)));
         assert_eq!(
             pipe.client.path_event_next(),
             Some(PathEvent::Validated(client_addr_2, server_addr))
@@ -14497,6 +14609,81 @@ mod tests {
             pipe.client.stream_recv(1, &mut recv_buf).unwrap();
         assert_eq!(fin, true);
         assert_eq!(rcv_data_1 + rcv_data_2, DATA_BYTES);
+    }
+
+    #[test]
+    fn multipath_recv_ack_mp() {
+        let mut buf = [0; 65535];
+        
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_enable_multipath(true);
+
+        let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert_eq!(pipe.client.enable_multipath, true);
+        assert_eq!(pipe.server.enable_multipath, true);
+
+        let frames = [frame::Frame::Ping, frame::Frame::Padding { len: 3 }];
+
+        let pkt_type = packet::Type::Short;
+
+        let len = pipe.send_pkt_to_server(pkt_type, &frames, &mut buf).unwrap();
+
+        let frames =
+            testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
+
+        match frames.first() {
+            Some(frame::Frame::ACK { pkt_num_space_id, .. }) => {
+                assert_eq!(pkt_num_space_id, &Some(0));
+            },
+    
+            f => panic!("expected ACK frame, got {:?}", f),
+        };
+    }
+
+    #[test]
+    fn multipath_add_path() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_enable_multipath(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 2);
+
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.client.paths.iter().filter(|(_, p)| p.active_dcid_seq == Some(1)).map(|(_, p)| p.active_scid_seq).next(), Some(Some(1)));
+        assert_eq!(pipe.server.paths.iter().filter(|(_, p)| p.active_dcid_seq == Some(1)).map(|(_, p)| p.active_scid_seq).next(), Some(Some(1)));
+
+        assert_eq!(pipe.client.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), false), Ok(3));
+        assert_eq!(pipe.client.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), true), Ok(3));
+        assert_eq!(pipe.server.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), false), Ok(3));
+        assert_eq!(pipe.server.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), true), Ok(3));
+
     }
 }
 

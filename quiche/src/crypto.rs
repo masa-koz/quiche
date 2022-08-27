@@ -212,6 +212,46 @@ impl Open {
         Ok(out_len)
     }
 
+    pub fn open_with_96bit_counter(
+        &self, counter_u32: u32, counter_u64: u64, ad: &[u8], buf: &mut [u8],
+    ) -> Result<usize> {
+        if cfg!(feature = "fuzzing") {
+            return Ok(buf.len());
+        }
+
+        let tag_len = self.alg().tag_len();
+
+        let mut out_len = match buf.len().checked_sub(tag_len) {
+            Some(n) => n,
+            None => return Err(Error::CryptoFail),
+        };
+
+        let max_out_len = out_len;
+
+        let nonce = make_nonce_96bit(&self.nonce, counter_u32, counter_u64);
+
+        let rc = unsafe {
+            EVP_AEAD_CTX_open(
+                &self.ctx,          // ctx
+                buf.as_mut_ptr(),   // out
+                &mut out_len,       // out_len
+                max_out_len,        // max_out_len
+                nonce[..].as_ptr(), // nonce
+                nonce.len(),        // nonce_len
+                buf.as_ptr(),       // inp
+                buf.len(),          // in_len
+                ad.as_ptr(),        // ad
+                ad.len(),           // ad_len
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        Ok(out_len)
+    }
+
     pub fn new_mask(&self, sample: &[u8]) -> Result<[u8; 5]> {
         if cfg!(feature = "fuzzing") {
             return Ok(<[u8; 5]>::default());
@@ -303,6 +343,61 @@ impl Seal {
         }
 
         let nonce = make_nonce(&self.nonce, counter);
+
+        let rc = unsafe {
+            EVP_AEAD_CTX_seal_scatter(
+                &self.ctx,                  // ctx
+                buf.as_mut_ptr(),           // out
+                buf[in_len..].as_mut_ptr(), // out_tag
+                &mut out_tag_len,           // out_tag_len
+                tag_len + extra_in_len,     // max_out_tag_len
+                nonce[..].as_ptr(),         // nonce
+                nonce.len(),                // nonce_len
+                buf.as_ptr(),               // inp
+                in_len,                     // in_len
+                extra_in_ptr,               // extra_in
+                extra_in_len,               // extra_in_len
+                ad.as_ptr(),                // ad
+                ad.len(),                   // ad_len
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        Ok(in_len + out_tag_len)
+    }
+
+    pub fn seal_with_96bit_counter(
+        &self, counter_u32: u32, counter_u64: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
+        extra_in: Option<&[u8]>,
+    ) -> Result<usize> {
+        if cfg!(feature = "fuzzing") {
+            if let Some(extra) = extra_in {
+                buf[in_len..in_len + extra.len()].copy_from_slice(extra);
+                return Ok(in_len + extra.len());
+            }
+
+            return Ok(in_len);
+        }
+
+        let tag_len = self.alg().tag_len();
+
+        let mut out_tag_len = tag_len;
+
+        let (extra_in_ptr, extra_in_len) = match extra_in {
+            Some(v) => (v.as_ptr(), v.len()),
+
+            None => (std::ptr::null(), 0),
+        };
+
+        // Make sure all the outputs combined fit in the buffer.
+        if in_len + tag_len + extra_in_len > buf.len() {
+            return Err(Error::CryptoFail);
+        }
+
+        let nonce = make_nonce_96bit(&self.nonce, counter_u32, counter_u64);
 
         let rc = unsafe {
             EVP_AEAD_CTX_seal_scatter(
@@ -528,6 +623,23 @@ fn make_nonce(iv: &[u8], counter: u64) -> [u8; aead::NONCE_LEN] {
     // XOR the last bytes of the IV with the counter. This is equivalent to
     // left-padding the counter with zero bytes.
     for (a, b) in nonce[4..].iter_mut().zip(counter.to_be_bytes().iter()) {
+        *a ^= b;
+    }
+
+    nonce
+}
+
+fn make_nonce_96bit(iv: &[u8], counter_u32: u32, counter_u64: u64) -> [u8; aead::NONCE_LEN] {
+    let mut nonce = [0; aead::NONCE_LEN];
+    nonce.copy_from_slice(iv);
+
+    for (a, b) in nonce[..4].iter_mut().zip(counter_u32.to_be_bytes().iter()) {
+        *a ^= b;
+    }
+
+    // XOR the last bytes of the IV with the counter. This is equivalent to
+    // left-padding the counter with zero bytes.
+    for (a, b) in nonce[4..].iter_mut().zip(counter_u64.to_be_bytes().iter()) {
         *a ^= b;
     }
 
