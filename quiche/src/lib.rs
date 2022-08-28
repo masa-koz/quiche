@@ -1621,11 +1621,12 @@ impl Connection {
         path.peer_verified_local_address = is_server;
 
         // Do not allocate more than the number of active CIDs.
-        let paths = path::PathMap::new(
+        let mut paths = path::PathMap::new(
             path,
             config.local_transport_params.active_conn_id_limit as usize,
             is_server,
         );
+        paths.set_scheduler(Some(Box::new(path::RoundRobinScheduler::new()))).unwrap();
 
         let active_path_id = paths.get_active_path_id()?;
 
