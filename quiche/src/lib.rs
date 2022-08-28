@@ -2711,7 +2711,7 @@ impl Connection {
         self.pkt_num_spaces.get_mut(space_id)?.largest_rx_pkt_num =
             cmp::max(self.pkt_num_spaces.get(space_id)?.largest_rx_pkt_num, pn);
 
-        if !probing {
+        if !probing && !self.enable_multipath {
             self.pkt_num_spaces.get_mut(space_id)?.largest_rx_non_probing_pkt_num = cmp::max(
                 self.pkt_num_spaces.get(space_id)?.largest_rx_non_probing_pkt_num,
                 pn,
@@ -3349,38 +3349,40 @@ impl Connection {
         }
 
         // Create ACK frame.
-        if self.pkt_num_spaces.get(space_id)?.recv_pkt_need_ack.len() > 0 &&
-            (self.pkt_num_spaces.get(space_id)?.ack_elicited ||
-                self.paths.get(send_pid)?.recovery.loss_probes[epoch] > 0) &&
-            !is_closing &&
-            self.paths.get(send_pid)?.active()
-        {
-            let ack_delay =
-                self.pkt_num_spaces.get(space_id)?.largest_rx_pkt_time.elapsed();
-
-            let ack_delay = ack_delay.as_micros() as u64 /
-                2_u64
-                    .pow(self.local_transport_params.ack_delay_exponent as u32);
-
-            let pkt_num_space_id = if self.enable_multipath && epoch == packet::EPOCH_APPLICATION{
-                let scid_seq = self
+        if !is_closing && self.paths.get(send_pid)?.active() {
+            let ack_space_ids = if self.enable_multipath && epoch == packet::EPOCH_APPLICATION {
+                self
                     .paths
-                    .get(send_pid)?
-                    .active_scid_seq
-                    .ok_or(Error::OutOfIdentifiers)?;
-                Some(scid_seq)
+                    .iter()
+                    .filter_map(|(pid, p)| p.active_scid_seq.map(|seq| (pid, seq)))
+                    .flat_map(|(pid, seq)| self.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(seq), false).map(|id| (pid, id, Some(seq))))
+                    .collect()
             } else {
-                None
+                vec![(send_pid, space_id, None)]
             };
-            let frame = frame::Frame::ACK {
-                pkt_num_space_id,
-                ack_delay,
-                ranges: self.pkt_num_spaces.get(space_id)?.recv_pkt_need_ack.clone(),
-                ecn_counts: None, // sending ECN is not supported at this time
-            };
-
-            if push_frame_to_pkt!(b, frames, frame, left) {
-                self.pkt_num_spaces.get_mut(space_id)?.ack_elicited = false;
+            for (ack_send_pid, ack_space_id, scid_seq) in ack_space_ids {
+                if self.pkt_num_spaces.get(ack_space_id)?.recv_pkt_need_ack.len() > 0 &&
+                    (self.pkt_num_spaces.get(ack_space_id)?.ack_elicited ||
+                        self.paths.get(ack_send_pid)?.recovery.loss_probes[epoch] > 0)
+                {
+                    let ack_delay =
+                        self.pkt_num_spaces.get(ack_space_id)?.largest_rx_pkt_time.elapsed();
+        
+                    let ack_delay = ack_delay.as_micros() as u64 /
+                        2_u64
+                            .pow(self.local_transport_params.ack_delay_exponent as u32);
+        
+                    let frame = frame::Frame::ACK {
+                        pkt_num_space_id: scid_seq,
+                        ack_delay,
+                        ranges: self.pkt_num_spaces.get(space_id)?.recv_pkt_need_ack.clone(),
+                        ecn_counts: None, // sending ECN is not supported at this time
+                    };
+        
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        self.pkt_num_spaces.get_mut(ack_space_id)?.ack_elicited = false;
+                    }
+                }
             }
         }
 
@@ -6868,6 +6870,7 @@ impl Connection {
 
         if self.enable_multipath {
             let pid = self.paths.schedule(1500)?;
+            eprintln!("pid: {}", pid);
             let p = self.paths.get(pid)?;
             if from.is_some() && Some(p.local_addr()) != from {
                 return Err(Error::Done);
@@ -7936,9 +7939,8 @@ pub mod testing {
             .ok_or(Error::InvalidState)?;
 
         let space_id = conn.pkt_num_spaces.get_space_id(epoch, Some(*active_dcid_seq), true)?;
-        let space = conn.pkt_num_spaces.get_mut(space_id)?;
 
-        let pn = space.next_pkt_num;
+        let pn = conn.pkt_num_spaces.get(space_id)?.next_pkt_num;
         let pn_len = 4;
 
         let hdr = Header {
@@ -7981,17 +7983,30 @@ pub mod testing {
             None => return Err(Error::InvalidState),
         };
 
-        let written = packet::encrypt_pkt(
-            &mut b,
-            pn,
-            pn_len,
-            payload_len,
-            payload_offset,
-            None,
-            aead,
-        )?;
+        let written = if conn.pkt_num_spaces.multi_spaces {
+            packet::encrypt_pkt_mp(
+                &mut b,
+                *active_dcid_seq,
+                pn,
+                pn_len,
+                payload_len,
+                payload_offset,
+                None,
+                aead,
+            )?    
+        } else {
+            packet::encrypt_pkt(
+                &mut b,
+                pn,
+                pn_len,
+                payload_len,
+                payload_offset,
+                None,
+                aead,
+            )?    
+        };
 
-        space.next_pkt_num += 1;
+        conn.pkt_num_spaces.get_mut(space_id)?.next_pkt_num += 1;
 
         Ok(written)
     }
@@ -8006,8 +8021,8 @@ pub mod testing {
         let epoch = hdr.ty.to_epoch()?;
 
         let scid_seq =
-            conn.ids.find_scid_seq(&hdr.dcid).map(|(seq, _)| seq);
-        let space_id = conn.pkt_num_spaces.get_space_id(epoch, scid_seq, false)?;
+            conn.ids.find_scid_seq(&hdr.dcid).map(|(seq, _)| seq).ok_or(Error::InvalidState)?;
+        let space_id = conn.pkt_num_spaces.get_space_id(epoch, Some(scid_seq), false);
 
         let aead = conn.crypto_ctxs[epoch].crypto_open.as_ref().unwrap();
 
@@ -8015,15 +8030,24 @@ pub mod testing {
 
         packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
 
+        let largest_rx_pkt_num = if space_id.is_ok() {
+            conn.pkt_num_spaces.get(space_id.unwrap())?.largest_rx_pkt_num
+        } else {
+            0
+        };
         let pn = packet::decode_pkt_num(
-            conn.pkt_num_spaces.get(space_id)?.largest_rx_pkt_num,
+            largest_rx_pkt_num,
             hdr.pkt_num,
             hdr.pkt_num_len,
         );
 
-        let mut payload =
+        let mut payload = if conn.pkt_num_spaces.multi_spaces {
+            packet::decrypt_pkt_mp(&mut b, scid_seq, pn, hdr.pkt_num_len, payload_len, aead)
+                .unwrap()
+        } else {
             packet::decrypt_pkt(&mut b, pn, hdr.pkt_num_len, payload_len, aead)
-                .unwrap();
+                .unwrap()
+        };
 
         let mut frames = Vec::new();
 
@@ -14699,23 +14723,54 @@ mod tests {
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
 
         assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
-        assert_eq!(pipe.advance(), Ok(()));
+        let mut flight = testing::emit_flight(&mut pipe.client).unwrap();
+        for (pkt, send_info) in &mut flight {
+            let len = pkt.len();
+            let frames = testing::decode_pkt(&mut pipe.server, &mut pkt.clone()[..], len).unwrap();
+            eprintln!("Client to Server: frames: {:?}, send_info: {:?}", frames, send_info);
+        }
+        assert_eq!(pipe.client.paths.iter().filter(|(_, p)| p.active_dcid_seq == Some(1)).map(|(_, p)| p.active_scid_seq).next(), Some(None));
 
-        assert_eq!(pipe.client.paths.iter().filter(|(_, p)| p.active_dcid_seq == Some(1)).map(|(_, p)| p.active_scid_seq).next(), Some(Some(1)));
+        testing::process_flight(&mut pipe.server, flight).unwrap();
         assert_eq!(pipe.server.paths.iter().filter(|(_, p)| p.active_dcid_seq == Some(1)).map(|(_, p)| p.active_scid_seq).next(), Some(Some(1)));
+
+        let mut flight = testing::emit_flight(&mut pipe.server).unwrap();
+        for (pkt, send_info) in &mut flight {
+            let len = pkt.len();
+            let frames = testing::decode_pkt(&mut pipe.client, &mut pkt.clone()[..], len).unwrap();
+            eprintln!("Server to Client: frames: {:?}, send_info: {:?}", frames, send_info);
+        }
+
+        testing::process_flight(&mut pipe.client, flight).unwrap();
 
         assert_eq!(pipe.client.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), false), Ok(3));
         assert_eq!(pipe.client.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), true), Ok(3));
         assert_eq!(pipe.server.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), false), Ok(3));
         assert_eq!(pipe.server.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), true), Ok(3));
 
-        assert_eq!(pipe.client.stream_send(0, b"data", false), Ok(4));
-        let flight = testing::emit_flight(&mut pipe.client).unwrap();
-        for (_, send_info) in &flight {
-            eprintln!("send_info: {:?}", send_info);
+        let buf = [0;4096];
+        assert_eq!(pipe.client.stream_send(0, &buf, false), Ok(4096));
+        let mut flight = testing::emit_flight(&mut pipe.client).unwrap();
+        for (pkt, send_info) in &mut flight {
+            let len = pkt.len();
+            let frames = testing::decode_pkt(&mut pipe.server, &mut pkt.clone()[..], len).unwrap();
+            eprintln!("frames: {:?}, send_info: {:?}", frames, send_info);
         }
         testing::process_flight(&mut pipe.server, flight).unwrap();
-        let flight = testing::emit_flight(&mut pipe.server).unwrap();
+        let server_space_id = pipe.server.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(0), false).unwrap();
+        let server_space_id2 = pipe.server.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), false).unwrap();
+        eprintln!("space: {:?}", pipe.server.pkt_num_spaces.get(server_space_id).unwrap());
+        eprintln!("space2: {:?}", pipe.server.pkt_num_spaces.get(server_space_id2).unwrap());
+
+        let mut flight = testing::emit_flight(&mut pipe.server).unwrap();
+        for (pkt, send_info) in &mut flight {
+            let len = pkt.len();
+            let frames = testing::decode_pkt(&mut pipe.client, &mut pkt.clone()[..], len).unwrap();
+            eprintln!("Server to Client: frames: {:?}, send_info: {:?}", frames, send_info);
+        }
+        eprintln!("space: {:?}", pipe.server.pkt_num_spaces.get(server_space_id).unwrap());
+        eprintln!("space2: {:?}", pipe.server.pkt_num_spaces.get(server_space_id2).unwrap());
+
         testing::process_flight(&mut pipe.client, flight).unwrap();
         assert_eq!(pipe.client.stream_send(0, b"data", false), Ok(4));
         let flight = testing::emit_flight(&mut pipe.client).unwrap();
