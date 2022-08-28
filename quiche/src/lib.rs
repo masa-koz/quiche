@@ -6871,7 +6871,6 @@ impl Connection {
 
         if self.enable_multipath {
             let pid = self.paths.schedule(1500)?;
-            eprintln!("pid: {}", pid);
             let p = self.paths.get(pid)?;
             if from.is_some() && Some(p.local_addr()) != from {
                 return Err(Error::Done);
