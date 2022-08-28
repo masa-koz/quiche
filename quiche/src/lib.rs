@@ -2069,6 +2069,8 @@ impl Connection {
             }
         }
 
+        self.paths.update_scheduler().unwrap();
+
         Ok(done)
     }
 
@@ -3044,6 +3046,7 @@ impl Connection {
 
             at: send_path.recovery.get_packet_send_time(),
         };
+        self.paths.update_scheduler().unwrap();
 
         Ok((done, info))
     }
@@ -5956,6 +5959,8 @@ impl Connection {
             self.pkt_num_spaces.multi_spaces = true;
         }
 
+        self.paths.enable_multipath(self.enable_multipath);
+
         self.peer_transport_params = peer_params;
 
         Ok(())
@@ -6842,7 +6847,7 @@ impl Connection {
 
     /// Selects the path on which the next packet must be sent.
     fn get_send_path_id(
-        &self, from: Option<SocketAddr>, to: Option<SocketAddr>,
+        &mut self, from: Option<SocketAddr>, to: Option<SocketAddr>,
     ) -> Result<usize> {
         // A probing packet must be sent, but only if the connection is fully
         // established.
@@ -6861,7 +6866,9 @@ impl Connection {
             }
         }
 
-        if let Some((pid, p)) = self.paths.get_active_with_pid() {
+        if self.enable_multipath {
+            let pid = self.paths.schedule(1500)?;
+            let p = self.paths.get(pid)?;
             if from.is_some() && Some(p.local_addr()) != from {
                 return Err(Error::Done);
             }
@@ -6871,7 +6878,19 @@ impl Connection {
             }
 
             return Ok(pid);
-        };
+        } else {
+            if let Some((pid, p)) = self.paths.get_active_with_pid() {
+                if from.is_some() && Some(p.local_addr()) != from {
+                    return Err(Error::Done);
+                }
+    
+                if to.is_some() && Some(p.peer_addr()) != to {
+                    return Err(Error::Done);
+                }
+    
+                return Ok(pid);
+            }    
+        }
 
         Err(Error::InvalidState)
     }
@@ -14666,9 +14685,15 @@ mod tests {
             .unwrap();
         config.verify_peer(false);
         config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_bidi_local(100000);
+        config.set_initial_max_stream_data_bidi_remote(100000);
+        config.set_initial_max_streams_bidi(2);
         config.set_enable_multipath(true);
 
         let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 2);
+
+        pipe.client.paths.set_scheduler(Some(Box::new(path::RoundRobinScheduler::new()))).unwrap();
 
         let server_addr = testing::Pipe::server_addr();
         let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
@@ -14683,6 +14708,23 @@ mod tests {
         assert_eq!(pipe.client.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), true), Ok(3));
         assert_eq!(pipe.server.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), false), Ok(3));
         assert_eq!(pipe.server.pkt_num_spaces.get_space_id(packet::EPOCH_APPLICATION, Some(1), true), Ok(3));
+
+        assert_eq!(pipe.client.stream_send(0, b"data", false), Ok(4));
+        let flight = testing::emit_flight(&mut pipe.client).unwrap();
+        for (_, send_info) in &flight {
+            eprintln!("send_info: {:?}", send_info);
+        }
+        testing::process_flight(&mut pipe.server, flight).unwrap();
+        let flight = testing::emit_flight(&mut pipe.server).unwrap();
+        testing::process_flight(&mut pipe.client, flight).unwrap();
+        assert_eq!(pipe.client.stream_send(0, b"data", false), Ok(4));
+        let flight = testing::emit_flight(&mut pipe.client).unwrap();
+        for (_, send_info) in &flight {
+            eprintln!("send_info: {:?}", send_info);
+        }
+        testing::process_flight(&mut pipe.server, flight).unwrap();
+        let flight = testing::emit_flight(&mut pipe.server).unwrap();
+        testing::process_flight(&mut pipe.client, flight).unwrap();
 
     }
 }

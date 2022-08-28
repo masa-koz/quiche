@@ -489,6 +489,11 @@ pub struct PathMap {
 
     /// Whether this manager serves a connection as a server.
     is_server: bool,
+
+    /// Wether multipath is enabled.
+    enable_multipath: bool,
+
+    packet_scheduler: Option<Box<dyn PacketScheduler + Send + Sync>>,
 }
 
 impl PathMap {
@@ -515,6 +520,8 @@ impl PathMap {
             addrs_to_paths,
             events: VecDeque::new(),
             is_server,
+            enable_multipath: false,
+            packet_scheduler: None,
         }
     }
 
@@ -646,9 +653,14 @@ impl PathMap {
 
         let local_addr = path.local_addr;
         let peer_addr = path.peer_addr;
+        let stats = path.stats();
 
         let pid = self.paths.insert(path);
         self.addrs_to_paths.insert((local_addr, peer_addr), pid);
+
+        if let Some(scheduler) = &mut self.packet_scheduler {
+            scheduler.add_path(pid, stats)?;
+        }
 
         // Notifies the application if we are in server mode.
         if is_server {
@@ -710,6 +722,7 @@ impl PathMap {
 
     /// Handles incoming PATH_RESPONSE data.
     pub fn on_response_received(&mut self, data: [u8; 8]) -> Result<()> {
+        let enable_multipath = self.enable_multipath;
         let active_pid = self.get_active_path_id()?;
 
         let challenge_pending =
@@ -723,6 +736,9 @@ impl PathMap {
 
                 p.migrating = false;
 
+                if enable_multipath {
+                    p.active = true;
+                }
                 // Notifies the application.
                 self.notify_event(PathEvent::Validated(local_addr, peer_addr));
 
@@ -797,6 +813,37 @@ impl PathMap {
         }
 
         Ok(())
+    }
+
+    pub fn enable_multipath(&mut self, enable: bool) {
+        self.enable_multipath = enable;
+    }
+
+    pub fn set_scheduler(&mut self, scheduler: Option<Box<dyn PacketScheduler + Send + Sync>>) -> Result<()>{
+        if let Some(mut scheduler) = scheduler {
+            for (path_id, path) in self.iter() {
+                scheduler.add_path(path_id, path.stats())?;
+            }
+            self.packet_scheduler = Some(scheduler);
+        }
+        Ok(())
+    }
+
+    pub fn update_scheduler(&mut self) -> Result<()>{
+        if let Some(mut scheduler) = self.packet_scheduler.take() {
+            for (path_id, path) in self.iter() {
+                scheduler.update_path(path_id, path.stats())?;
+            }
+            self.packet_scheduler = Some(scheduler);          
+        }
+        Ok(())
+    }
+
+    pub fn schedule(&mut self, packet_len: usize) -> Result<usize> {
+        if let Some(scheduler) = &mut self.packet_scheduler {
+            return scheduler.schedule(packet_len);
+        }
+        self.get_active_path_id()
     }
 }
 
@@ -893,6 +940,71 @@ impl std::fmt::Debug for PathStats {
             " stream_retrans_bytes={} pmtu={} delivery_rate={}",
             self.stream_retrans_bytes, self.pmtu, self.delivery_rate,
         )
+    }
+}
+
+pub trait PacketScheduler {
+    fn add_path(&mut self, path_id: usize, stats: PathStats) -> Result<usize>;
+    fn remove_path(&mut self, path_id: usize) -> Result<usize>;
+    fn update_path(&mut self, path_id: usize, stats: PathStats) -> Result<()>;
+    fn schedule(&mut self, packet_len: usize) -> Result<usize>;
+}
+
+pub struct RoundRobinScheduler {
+    paths: Slab<(usize, PathStats)>,
+    id_to_paths: BTreeMap<usize, usize>,
+    path_lists: Vec<usize>,
+}
+
+impl RoundRobinScheduler {
+    pub fn new() -> Self {
+        RoundRobinScheduler {
+            paths: Slab::with_capacity(1),
+            id_to_paths: BTreeMap::new(),
+            path_lists: Vec::new(),
+        }
+    }
+}
+
+impl PacketScheduler for RoundRobinScheduler {
+    fn add_path(&mut self, path_id: usize, stats: PathStats) -> Result<usize> {
+        let internal_id = self.paths.insert((path_id, stats));
+        self.path_lists.push(internal_id);
+        self.id_to_paths.insert(path_id, internal_id);
+        Ok(self.path_lists.len())
+    }
+
+    fn remove_path(&mut self, path_id: usize) -> Result<usize> {
+        let internal_id = self.id_to_paths.remove(&path_id).ok_or(Error::InvalidState)?;
+        self.path_lists.retain(|id| *id != internal_id);
+        self.paths.remove(internal_id);
+        Ok(self.path_lists.len())
+    }
+
+    fn update_path(&mut self, path_id: usize, new_stats: PathStats) -> Result<()>{
+        let internal_id = *self.id_to_paths.get(&path_id).ok_or(Error::InvalidState)?;
+        let (_, stats) = self.paths.get_mut(internal_id).ok_or(Error::InvalidState)?;
+        *stats = new_stats;
+        Ok(())
+    }
+
+    fn schedule(&mut self, packet_len: usize) -> Result<usize> {
+        let (index, path_id) = self
+            .path_lists
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| {
+                let (path_id, stats) = self.paths.get(*id).unwrap();
+                if stats.active && stats.cwnd - stats.sent_bytes as usize > packet_len {
+                    Some((index, *path_id))
+                } else {
+                    None
+                }
+            })
+            .next()
+            .ok_or(Error::Done)?;
+        self.path_lists[index..].rotate_left(1);
+        Ok(path_id)
     }
 }
 
@@ -1062,5 +1174,29 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn round_robin_scheduler() {
+        let round_robin = Box::new(RoundRobinScheduler::new());
+
+        let client_addr = "127.0.0.1:1234".parse().unwrap();
+        let client_addr2 = "127.0.0.1:5678".parse().unwrap();
+        let server_addr = "127.0.0.1:4321".parse().unwrap();
+
+        let config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        let recovery_config = RecoveryConfig::from_config(&config);
+
+        let path = Path::new(client_addr, server_addr, &recovery_config, true);
+        let mut path_mgr = PathMap::new(path, 2, false);
+        path_mgr.set_scheduler(Some(round_robin)).unwrap();
+
+        let mut path2 = Path::new(client_addr2, server_addr, &recovery_config, true);
+        path2.active = true;
+        path_mgr.insert_path(path2, false).unwrap();
+
+        assert_eq!(path_mgr.schedule(1500).unwrap(), 0);
+        assert_eq!(path_mgr.schedule(1500).unwrap(), 1);
+        assert_eq!(path_mgr.schedule(1500).unwrap(), 0);
     }
 }
