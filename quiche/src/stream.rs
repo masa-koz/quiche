@@ -104,6 +104,12 @@ pub struct StreamMap {
     /// created streams, to prevent peers from re-creating them.
     collected: StreamIdHashSet,
 
+    /// Map of error codes indexed by stream ID.
+    /// 
+    /// The stream may be collected before the application reads the error code
+    /// received via STOP_SENDING, so we need to reatain it.
+    send_errors: StreamIdHashMap<u64>,
+
     /// Peer's maximum bidirectional stream count limit.
     peer_max_streams_bidi: u64,
 
@@ -538,8 +544,18 @@ impl StreamMap {
             }
         }
 
-        self.streams.remove(&stream_id);
+        if let Some(stream) = self.streams.remove(&stream_id) {
+            // We need to keep track of the error code received via STOP_SENDING.
+            if let Some(error) = stream.send.error {
+                self.send_errors.insert(stream_id, error);
+            }
+        }
         self.collected.insert(stream_id);
+    }
+
+    /// Return the send error code of the collected stream
+    pub fn send_error(&self, stream_id: u64) -> Option<u64> {
+        self.send_errors.get(&stream_id).copied()
     }
 
     /// Creates an iterator over streams that have outstanding data to read.

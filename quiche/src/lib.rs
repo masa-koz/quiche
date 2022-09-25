@@ -4322,7 +4322,19 @@ impl Connection {
         };
 
         // Get existing stream or create a new one.
-        let stream = self.get_or_create_stream(stream_id, true)?;
+        let stream = match self.get_or_create_stream(stream_id, true) {
+            Ok(v) => v,
+
+            Err(Error::Done) => {
+                if let Some(code) = self.streams.send_error(stream_id) {
+                    return Err(Error::StreamStopped(code));
+                } else {
+                    return Err(Error::Done);
+                }
+            }
+
+            Err(e) => return Err(e),
+        };
 
         #[cfg(feature = "qlog")]
         let offset = stream.send.off_back();
@@ -4527,6 +4539,9 @@ impl Connection {
             let cap = cmp::min(self.tx_cap, stream.send.cap()?);
             return Ok(cap);
         };
+        if let Some(code) = self.streams.send_error(stream_id) {
+            return Err(Error::StreamStopped(code));
+        }
 
         Err(Error::InvalidStreamState(stream_id))
     }
@@ -9757,6 +9772,12 @@ mod tests {
 
         let mut r = pipe.server.writable();
         assert_eq!(r.next(), None);
+
+        assert_eq!(
+            pipe.server.stream_send(0, b"world", true),
+            Err(Error::StreamStopped(42)),
+        );
+
     }
 
     #[test]
