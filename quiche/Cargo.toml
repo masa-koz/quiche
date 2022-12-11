@@ -36,6 +36,12 @@ boringssl-vendored = []
 # Use the BoringSSL library provided by the boring crate.
 boringssl-boring-crate = ["boring", "foreign-types-shared"]
 
+# Build picotls with openssl backend
+picotls-openssl = []
+
+# Build picotls with minicryoto backend
+picotls-minicrypto = []
+
 # Generate pkg-config metadata file for libquiche.
 pkg-config-meta = []
 

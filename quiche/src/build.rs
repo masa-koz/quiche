@@ -170,6 +170,13 @@ fn get_boringssl_cmake_config() -> cmake::Config {
     }
 }
 
+/// Returns a new cmake::Config for building picotls.
+///
+/// It will add platform-specific parameters if needed.
+fn get_picotls_cmake_config() -> cmake::Config {
+    cmake::Config::new("deps/picotls")
+}
+
 fn write_pkg_config() {
     use std::io::prelude::*;
 
@@ -218,7 +225,9 @@ fn target_dir_path() -> std::path::PathBuf {
 
 fn main() {
     if cfg!(feature = "boringssl-vendored") &&
-        !cfg!(feature = "boringssl-boring-crate")
+        !cfg!(feature = "boringssl-boring-crate") &&
+        !cfg!(feature = "picotls-openssl") &&
+        !cfg!(feature = "picotls-minicrypto")
     {
         let bssl_dir = std::env::var("QUICHE_BSSL_PATH").unwrap_or_else(|_| {
             let mut cfg = get_boringssl_cmake_config();
@@ -240,9 +249,39 @@ fn main() {
         println!("cargo:rustc-link-lib=static=crypto");
     }
 
-    if cfg!(feature = "boringssl-boring-crate") {
+    if cfg!(feature = "boringssl-boring-crate") &&
+        !cfg!(feature = "picotls-openssl") &&
+        !cfg!(feature = "picotls-minicrypto")
+    {
         println!("cargo:rustc-link-lib=static=ssl");
         println!("cargo:rustc-link-lib=static=crypto");
+    }
+
+    if cfg!(feature = "picotls-openssl") &&
+        !cfg!(feature = "picotls-minicrypto")
+    {
+        let picotls_dir = std::env::var("QUICHE_PICOTLS_PATH").unwrap_or_else(|_| {
+            let mut cfg = get_picotls_cmake_config();
+
+            cfg.build_target("picotls-openssl").build().display().to_string()
+        });
+        let build_dir = format!("{}/build", picotls_dir);
+        println!("cargo:rustc-link-search=native={}", build_dir);
+        println!("cargo:rustc-link-lib=static=picotls-openssl");
+
+    }
+
+    if cfg!(feature = "picotls-minicrypto")
+    {
+        let picotls_dir = std::env::var("QUICHE_PICOTLS_PATH").unwrap_or_else(|_| {
+            let mut cfg = get_picotls_cmake_config();
+
+            cfg.build_target("picotls-minicrypto").build().display().to_string()
+        });
+        let build_dir = format!("{}/build", picotls_dir);
+        println!("cargo:rustc-link-search=native={}", build_dir);
+        println!("cargo:rustc-link-lib=static=picotls-minicrypto");
+
     }
 
     // MacOS: Allow cdylib to link with undefined symbols
