@@ -28,8 +28,8 @@ include = [
 ]
 
 [features]
-default = ["boringssl-vendored"]
-#default = ["schannel"]
+#default = ["boringssl-vendored"]
+default = ["schannel"]
 
 # Build the vendored BoringSSL library.
 boringssl-vendored = [

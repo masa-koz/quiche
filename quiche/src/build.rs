@@ -245,6 +245,26 @@ fn main() {
         println!("cargo:rustc-link-lib=static=crypto");
     }
 
+    if cfg!(feature = "schannel")
+    {
+        let bssl_dir = std::env::var("QUICHE_BSSL_PATH").unwrap_or_else(|_| {
+            let mut cfg = get_boringssl_cmake_config();
+
+            if cfg!(feature = "fuzzing") {
+                cfg.cxxflag("-DBORINGSSL_UNSAFE_DETERMINISTIC_MODE")
+                    .cxxflag("-DBORINGSSL_UNSAFE_FUZZER_MODE");
+            }
+
+            cfg.build_target("crypto").build().display().to_string()
+        });
+
+        let build_path = get_boringssl_platform_output_path();
+        let build_dir = format!("{}/build/{}", bssl_dir, build_path);
+        println!("cargo:rustc-link-search=native={}", build_dir);
+
+        println!("cargo:rustc-link-lib=static=crypto");
+    }
+
     // MacOS: Allow cdylib to link with undefined symbols
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     if target_os == "macos" {
