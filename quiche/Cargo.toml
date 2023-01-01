@@ -29,12 +29,33 @@ include = [
 
 [features]
 default = ["boringssl-vendored"]
+#default = ["schannel"]
 
 # Build the vendored BoringSSL library.
-boringssl-vendored = []
+boringssl-vendored = [
+    "winapi/wincrypt",
+    "winapi/ws2def",
+    "winapi/ws2ipdef",
+    "winapi/ws2tcpip",
+]
 
 # Use the BoringSSL library provided by the boring crate.
-boringssl-boring-crate = ["boring", "foreign-types-shared"]
+boringssl-boring-crate = [
+    "boring",
+    "foreign-types-shared",
+    "winapi/wincrypt",
+    "winapi/ws2def",
+    "winapi/ws2ipdef",
+    "winapi/ws2tcpip",
+    ]
+
+schannel = [
+    "winapi/sspi",
+    "winapi/wincrypt",
+    "winapi/ws2def",
+    "winapi/ws2ipdef",
+    "winapi/ws2tcpip",
+]
 
 # Generate pkg-config metadata file for libquiche.
 pkg-config-meta = []
@@ -67,7 +88,7 @@ qlog = { version = "0.8", path = "../qlog", optional = true }
 sfv = { version = "0.9", optional = true }
 
 [target."cfg(windows)".dependencies]
-winapi = { version = "0.3", features = ["wincrypt", "ws2def", "ws2ipdef", "ws2tcpip"] }
+winapi = { version = "0.3", optional = true }
 
 [dev-dependencies]
 mio = { version = "0.8", features = ["net", "os-poll"] }
