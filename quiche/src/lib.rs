@@ -7543,6 +7543,20 @@ impl Connection {
     fn get_send_path_id(
         &self, from: Option<SocketAddr>, to: Option<SocketAddr>,
     ) -> Result<usize> {
+        // When a PTO timer expires, a sender MUST send at least one ack-eliciting packet.
+        let mut pto = self
+            .paths
+            .iter()
+            .filter(|(_, p)| from.is_none() || Some(p.local_addr()) == from)
+            .filter(|(_, p)| to.is_none() || Some(p.peer_addr()) == to)
+            .filter(|(_, p)| p.usable())
+            .filter(|(_, p)| p.recovery.loss_probes.iter().any(|&x| x > 0))
+            .map(|(pid, _)| pid);
+
+        if let Some(pid) = pto.next() {
+            return Ok(pid);
+        }
+
         // A probing packet must be sent, but only if the connection is fully
         // established.
         if self.is_established() {
@@ -16396,6 +16410,178 @@ mod tests {
         let pipe = pipe_with_exchanged_cids(&mut config, 0, 16, 1);
 
         assert_eq!(pipe.client.is_multipath_enabled(), false);
+    }
+
+    #[test]
+    fn multipath_early_retransmit_to_same_path() {
+        let mut buf = [0; 65535];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_bidi_local(100000);
+        config.set_initial_max_stream_data_bidi_remote(100000);
+        config.set_initial_max_streams_bidi(2);
+        config.set_multipath(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+        assert_eq!(pipe.client.is_multipath_enabled(), true);
+        assert_eq!(pipe.server.is_multipath_enabled(), true);
+
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2))
+        );
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        let pid_c2s_0 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr, server_addr))
+            .expect("no such path");
+        let pid_c2s_1 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr_2, server_addr))
+            .expect("no such path");
+        let pid_s2c_0 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr))
+            .expect("no such path");
+        let pid_s2c_1 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr_2))
+            .expect("no such path");
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), false);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), false);
+
+        assert_eq!(
+            pipe.client.set_active(client_addr_2, server_addr, true,),
+            Ok(())
+        );
+        assert_eq!(
+            pipe.server.set_active(server_addr, client_addr_2, true,),
+            Ok(())
+        );
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), true);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), true);
+
+        // Flush the ACK_MP on the newly active path.
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Client sends stream data, but packet is lost
+        assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+        let res = pipe.client.send(&mut buf);
+        assert!(res.is_ok());
+        let (_, send_info) = res.unwrap();
+
+        let pid_c2s_send = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(send_info.from, send_info.to))
+            .expect("no such path");
+
+        // Wait until PTO expires. Since the RTT is very low, wait a bit more.
+        let timer = pipe.client.timeout().unwrap();
+        std::thread::sleep(timer + time::Duration::from_millis(1));
+
+        pipe.client.on_timeout();
+
+        let epoch = packet::Epoch::Application;
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_send)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            1,
+        );
+
+        // Client retransmits stream data in PTO probe.
+        let res = pipe.client.send(&mut buf);
+        assert!(res.is_ok());
+        let (len, send_info) = res.unwrap();
+
+        let pid_c2s_pto = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(send_info.from, send_info.to))
+            .expect("no such path");
+
+        assert_eq!(pid_c2s_send, pid_c2s_pto);
+
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_pto)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            0,
+        );
+        let frames =
+            testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
+
+        let mut iter = frames.iter();
+
+        // Skip ACK_MP frame.
+        iter.next();
+        iter.next();
+
+        assert_eq!(
+            iter.next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 0,
+                data: stream::RangeBuf::from(b"a", 0, false),
+            })
+        );
+        assert_eq!(pipe.client.stats().retrans, 1);
+
     }
 }
 
