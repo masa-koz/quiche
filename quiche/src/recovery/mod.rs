@@ -92,7 +92,7 @@ impl SpacedPktNum {
 pub struct Recovery {
     loss_detection_timer: Option<Instant>,
 
-    pto_count: u32,
+    pub pto_count: u32,
 
     time_of_last_sent_ack_eliciting_pkt:
         [Option<Instant>; packet::Epoch::count()],

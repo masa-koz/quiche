@@ -138,6 +138,20 @@ impl From<u64> for PathStatus {
     }
 }
 
+/// The different states of the path about failure.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathFailureState {
+    /// The path not failure path.
+    NotFailure,
+
+    /// The path may be failure path.
+    PotentialFailure,
+
+    /// The path is failure path.
+    Failure,
+}
+
+
 /// A path-specific event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PathEvent {
@@ -246,6 +260,9 @@ pub struct Path {
     /// The scheduling status of this path.
     status: PathStatus,
 
+    /// The failure status of this path.
+    failure: PathFailureState,
+
     /// Total number of bytes the server can send before the peer's address
     /// is verified.
     pub max_send_bytes: usize,
@@ -271,6 +288,9 @@ pub struct Path {
 
     /// The expected sequence number of the PATH_STATUS to be received.
     expected_path_status_seq_num: u64,
+
+    /// The potential failed threshold on the pto count.
+    pf_max_pto: u32,
 }
 
 impl Path {
@@ -278,7 +298,8 @@ impl Path {
     /// the fields being set to their default value.
     pub fn new(
         local_addr: SocketAddr, peer_addr: SocketAddr,
-        recovery_config: &recovery::RecoveryConfig, is_initial: bool,
+        recovery_config: &recovery::RecoveryConfig, pf_max_pto: u32,
+        is_initial: bool,
     ) -> Self {
         let (validation_state, active_scid_seq, active_dcid_seq) = if is_initial {
             (PathValidationState::Validated, Some(0), Some(0))
@@ -308,6 +329,7 @@ impl Path {
             closing_timer: None,
             peer_abandoned: false,
             status: PathStatus::Available,
+            failure: PathFailureState::NotFailure,
             max_send_bytes: 0,
             verified_peer_address: false,
             peer_verified_local_address: false,
@@ -316,6 +338,7 @@ impl Path {
             migrating: false,
             needs_ack_eliciting: false,
             expected_path_status_seq_num: 0,
+            pf_max_pto,
         }
     }
 
@@ -358,6 +381,18 @@ impl Path {
     fn unused(&self) -> bool {
         // FIXME: we should check that there is nothing in the sent queue.
         !self.active() && self.active_dcid_seq.is_none()
+    }
+
+    /// Returns whether the path is not failure path.
+    #[inline]
+    pub fn not_failure(&self) -> bool {
+        self.failure == PathFailureState::NotFailure
+    }
+
+    /// Returns whether the path is failure path.
+    #[inline]
+    pub fn failure(&self) -> bool {
+        self.failure == PathFailureState::Failure
     }
 
     /// Returns whether the path requires sending a probing packet.
@@ -551,11 +586,20 @@ impl Path {
         &mut self, handshake_status: HandshakeStatus, now: time::Instant,
         is_server: bool, trace_id: &str,
     ) -> (usize, usize) {
-        let (lost_packets, lost_bytes) = self.recovery.on_loss_detection_timeout(
+        let (mut lost_packets, mut lost_bytes) = self.recovery.on_loss_detection_timeout(
             handshake_status,
             now,
             trace_id,
         );
+        (lost_packets, lost_bytes) = if lost_packets == 0 && lost_bytes == 0
+            && self.not_failure()
+            && self.recovery.pto_count > self.pf_max_pto
+        {
+            self.failure = PathFailureState::PotentialFailure;
+            self.recovery.mark_all_inflight_as_lost(now, trace_id)
+        } else {
+            (lost_packets, lost_bytes)
+        };
 
         let mut lost_probe_time = None;
         self.in_flight_challenges.retain(|(_, _, sent_time)| {
@@ -1306,11 +1350,11 @@ mod tests {
         let config = Config::new(crate::PROTOCOL_VERSION).unwrap();
         let recovery_config = RecoveryConfig::from_config(&config);
 
-        let path = Path::new(client_addr, server_addr, &recovery_config, true);
+        let path = Path::new(client_addr, server_addr, &recovery_config, 1, true);
         let mut path_mgr = PathMap::new(path, 2, false);
 
         let probed_path =
-            Path::new(client_addr_2, server_addr, &recovery_config, false);
+            Path::new(client_addr_2, server_addr, &recovery_config, 1, false);
         path_mgr.insert_path(probed_path, false).unwrap();
 
         let pid = path_mgr
@@ -1386,10 +1430,10 @@ mod tests {
         let config = Config::new(crate::PROTOCOL_VERSION).unwrap();
         let recovery_config = RecoveryConfig::from_config(&config);
 
-        let path = Path::new(client_addr, server_addr, &recovery_config, true);
+        let path = Path::new(client_addr, server_addr, &recovery_config, 1, true);
         let mut client_path_mgr = PathMap::new(path, 2, false);
         let mut server_path =
-            Path::new(server_addr, client_addr, &recovery_config, false);
+            Path::new(server_addr, client_addr, &recovery_config, 1, false);
 
         let client_pid = client_path_mgr
             .path_id_from_addrs(&(client_addr, server_addr))
@@ -1466,17 +1510,17 @@ mod tests {
         let config = Config::new(crate::PROTOCOL_VERSION).unwrap();
         let recovery_config = RecoveryConfig::from_config(&config);
 
-        let path = Path::new(client_addr, server_addr, &recovery_config, true);
+        let path = Path::new(client_addr, server_addr, &recovery_config, 1, true);
         let mut paths = PathMap::new(path, 3, true);
         let pid = paths
             .path_id_from_addrs(&(client_addr, server_addr))
             .unwrap();
 
         let path_2 =
-            Path::new(client_addr_2, server_addr, &recovery_config, false);
+            Path::new(client_addr_2, server_addr, &recovery_config, 1, false);
         let pid_2 = paths.insert_path(path_2, false).unwrap();
         let path_3 =
-            Path::new(client_addr_3, server_addr, &recovery_config, false);
+            Path::new(client_addr_3, server_addr, &recovery_config, 1, false);
         let pid_3 = paths.insert_path(path_3, false).unwrap();
 
         assert_eq!(paths.set_path_status(pid_2, PathStatus::Standby), Ok(()));
