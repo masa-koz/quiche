@@ -689,6 +689,8 @@ pub struct Config {
     max_stream_window: u64,
 
     disable_dcid_reuse: bool,
+
+    pf_max_pto: u32,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -747,6 +749,8 @@ impl Config {
             max_stream_window: stream::MAX_STREAM_WINDOW,
 
             disable_dcid_reuse: false,
+
+            pf_max_pto: 1,
         })
     }
 
@@ -1157,6 +1161,13 @@ impl Config {
     pub fn set_disable_dcid_reuse(&mut self, v: bool) {
         self.disable_dcid_reuse = v;
     }
+
+    /// Sets the potential failed threshold on the pto count.
+    ///
+    /// The default value is 1.
+    pub fn set_potentially_failed_max_pto(&mut self, v: u32) {
+        self.pf_max_pto = v;
+    }
 }
 
 /// A QUIC connection.
@@ -1346,6 +1357,10 @@ pub struct Connection {
 
     /// Structure used when coping with abandoned paths in multipath.
     wire_pids_to_close: VecDeque<(u64, Option<u64>)>,
+    
+    /// The potential failed threshold on the pto count.
+    pf_max_pto: u32,
+
 }
 
 /// Creates a new server-side connection.
@@ -1635,7 +1650,13 @@ impl Connection {
 
         let recovery_config = recovery::RecoveryConfig::from_config(config);
 
-        let mut path = path::Path::new(local, peer, &recovery_config, true);
+        let mut path = path::Path::new(
+            local,
+            peer,
+            &recovery_config,
+            config.pf_max_pto,
+            true
+        );
         // If we did stateless retry assume the peer's address is verified.
         path.verified_peer_address = odcid.is_some();
         // Assume clients validate the server's address implicitly.
@@ -1778,6 +1799,8 @@ impl Connection {
             disable_dcid_reuse: config.disable_dcid_reuse,
 
             wire_pids_to_close: VecDeque::new(),
+
+            pf_max_pto: config.pf_max_pto,
         };
 
         // Don't support multipath with zero-length CIDs.
@@ -2973,7 +2996,7 @@ impl Connection {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn send(&mut self, out: &mut [u8]) -> Result<(usize, SendInfo)> {
-        self.send_on_path(out, None, None)
+        self.send_on_path(out, None, None, false)
     }
 
     /// Writes a single QUIC packet to be sent to the peer from the specified
@@ -3061,7 +3084,7 @@ impl Connection {
     /// ```
     pub fn send_on_path(
         &mut self, out: &mut [u8], from: Option<SocketAddr>,
-        to: Option<SocketAddr>,
+        to: Option<SocketAddr>, use_failure: bool,
     ) -> Result<(usize, SendInfo)> {
         if out.is_empty() {
             return Err(Error::BufferTooShort);
@@ -3097,13 +3120,14 @@ impl Connection {
         // maximum UDP payload size limit.
         let mut left = cmp::min(out.len(), self.max_send_udp_payload_size());
 
-        let send_pid = match (from, to) {
+        let (send_pid, use_failure) = match (from, to) {
             (Some(f), Some(t)) => self
                 .paths
                 .path_id_from_addrs(&(f, t))
+                .map(|v| (v, use_failure))
                 .ok_or(Error::InvalidState)?,
 
-            _ => self.get_send_path_id(from, to)?,
+            _ => self.get_send_path_id(from, to, use_failure)?,
         };
 
         let send_path = self.paths.get_mut(send_pid)?;
@@ -3120,6 +3144,7 @@ impl Connection {
                 &mut out[done..done + left],
                 send_pid,
                 has_initial,
+                use_failure,
             ) {
                 Ok(v) => v,
 
@@ -3150,7 +3175,7 @@ impl Connection {
 
             // Don't coalesce packets that must go on different paths.
             if !(from.is_some() && to.is_some()) &&
-                self.get_send_path_id(from, to)? != send_pid
+                self.get_send_path_id(from, to, use_failure)?.0 != send_pid
             {
                 break;
             }
@@ -3187,6 +3212,7 @@ impl Connection {
 
     fn send_single(
         &mut self, out: &mut [u8], send_pid: usize, has_initial: bool,
+        use_failure: bool,
     ) -> Result<(packet::Type, usize)> {
         let now = time::Instant::now();
 
@@ -3498,7 +3524,8 @@ impl Connection {
                     self.local_error
                         .as_ref()
                         .map_or(false, |le| le.is_app))) &&
-            path.active()
+            path.active() &&
+            (path.not_failure() || use_failure)
         {
             let ack_delay = pkt_space.largest_rx_pkt_time.elapsed();
 
@@ -3529,7 +3556,8 @@ impl Connection {
         // Create ACK_MP frames if needed.
         if multiple_application_data_pkt_num_spaces &&
             !is_closing &&
-            path.active()
+            path.active() &&
+            (path.not_failure() || use_failure)
         {
             // We first check if we should bundle the ACK_MP belonging to our
             // path. We only bundle additional ACK_MP from other paths if we
@@ -3664,7 +3692,10 @@ impl Connection {
             }
         }
 
-        if pkt_type == packet::Type::Short && !is_closing {
+        if pkt_type == packet::Type::Short &&
+            !is_closing &&
+            (path.not_failure() || use_failure)
+        {
             // Create NEW_CONNECTION_ID frames as needed.
             while let Some(seq_num) = self.ids.next_advertise_new_scid_seq() {
                 let frame = self.ids.get_new_connection_id_frame_for(seq_num)?;
@@ -3680,7 +3711,11 @@ impl Connection {
             }
         }
 
-        if pkt_type == packet::Type::Short && !is_closing && path.active() {
+        if pkt_type == packet::Type::Short &&
+            !is_closing &&
+            path.active() &&
+            (path.not_failure() || use_failure)
+        {
             // Create HANDSHAKE_DONE frame.
             // self.should_send_handshake_done() but without the need to borrow
             if self.handshake_completed &&
@@ -3932,7 +3967,7 @@ impl Connection {
 
         // Create CONNECTION_CLOSE frame. Try to send this only on the active
         // path, unless it is the last one available.
-        if path.active() || n_paths == 1 {
+        if (path.active() && (path.not_failure() || use_failure)) || n_paths == 1 {
             if let Some(conn_err) = self.local_error.as_ref() {
                 if conn_err.is_app {
                     // Create ApplicationClose frame.
@@ -3974,7 +4009,8 @@ impl Connection {
         if crypto_space.crypto_stream.is_flushable() &&
             left > frame::MAX_CRYPTO_OVERHEAD &&
             !is_closing &&
-            path.active()
+            path.active() &&
+            (path.not_failure() || use_failure)
         {
             let crypto_off = crypto_space.crypto_stream.send.off_front();
 
@@ -4057,6 +4093,7 @@ impl Connection {
             left > frame::MAX_DGRAM_OVERHEAD &&
             !is_closing &&
             path.active() &&
+            (path.not_failure() || use_failure) &&
             do_dgram
         {
             if let Some(max_dgram_payload) = max_dgram_len {
@@ -4135,6 +4172,7 @@ impl Connection {
             left > frame::MAX_STREAM_OVERHEAD &&
             !is_closing &&
             path.active() &&
+            (path.not_failure() || use_failure) &&
             !dgram_emitted &&
             (consider_standby_paths || !path.is_standby())
         {
@@ -7523,8 +7561,12 @@ impl Connection {
         }
 
         // This is a new path using an unassigned CID; create it!
-        let mut path =
-            path::Path::new(info.to, info.from, &self.recovery_config, false);
+        let mut path = path::Path::new(
+            info.to,
+            info.from,
+            &self.recovery_config,
+            self.pf_max_pto,
+            false);
 
         path.max_send_bytes = buf_len * MAX_AMPLIFICATION_FACTOR;
 
@@ -7542,8 +7584,23 @@ impl Connection {
     /// Selects the path on which the next packet must be sent.
     fn get_send_path_id(
         &self, from: Option<SocketAddr>, to: Option<SocketAddr>,
-    ) -> Result<usize> {
-        // A probing packet must be sent, but only if the connection is fully
+        use_failure: bool,
+    ) -> Result<(usize, bool)> {
+        // When a PTO timer expires, a sender MUST send at least one ack-eliciting packet.
+        let mut pto = self
+            .paths
+            .iter()
+            .filter(|(_, p)| from.is_none() || Some(p.local_addr()) == from)
+            .filter(|(_, p)| to.is_none() || Some(p.peer_addr()) == to)
+            .filter(|(_, p)| p.usable())
+            .filter(|(_, p)| p.recovery.loss_probes.iter().any(|&x| x > 0))
+            .map(|(pid, _)| pid);
+
+        if let Some(pid) = pto.next() {
+            return Ok((pid, use_failure));
+        }
+
+        // A probing or ack eliciting packet must be sent, but only if the connection is fully
         // established.
         if self.is_established() {
             let mut probing = self
@@ -7552,15 +7609,17 @@ impl Connection {
                 .filter(|(_, p)| from.is_none() || Some(p.local_addr()) == from)
                 .filter(|(_, p)| to.is_none() || Some(p.peer_addr()) == to)
                 .filter(|(_, p)| p.active_dcid_seq.is_some())
-                .filter(|(_, p)| p.probing_required())
+                .filter(|(_, p)| p.probing_required() || p.needs_ack_eliciting)
                 .map(|(pid, _)| pid);
 
             if let Some(pid) = probing.next() {
-                return Ok(pid);
+                return Ok((pid, use_failure));
             }
         }
 
         let mut consider_standby = false;
+        let mut consider_pf = false;
+        let mut consider_failure = false;
         let dgrams_to_emit = self.dgram_send_queue.has_pending();
         let stream_to_emit = self.streams.has_flushable();
         // When using aggregate mode, favour lowest-latency path on which CWIN
@@ -7569,7 +7628,7 @@ impl Connection {
         if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
             // We loop at most twice.
             loop {
-                if let Some(pid) = self
+                let filtered = self
                     .paths
                     .iter()
                     .filter(|(_, p)| {
@@ -7577,18 +7636,37 @@ impl Connection {
                         let local = from.map(|f| f == p.local_addr()).unwrap_or(true);
                         let peer = to.map(|t| t == p.peer_addr()).unwrap_or(true);
                         // Favour non-standby paths first, only consider active ones with open CWND.
-                        local && peer && (consider_standby || !p.is_standby()) && p.active() && p.recovery.cwnd_available() > 0
-                    })
+                        local && peer
+                            && p.active()
+                            && (consider_standby || !p.is_standby())
+                            && (p.not_failure()
+                                || (consider_pf && !p.failure())
+                                || consider_failure
+                                || use_failure)
+                            && p.recovery.cwnd_available() > 0
+                    });
+                if let Some(pid) = if !consider_pf && !consider_failure {
                     // Lowest-latency first.
-                    .min_by_key(|(_, p)| p.recovery.rtt())
+                    filtered.min_by_key(|(_, p)| p.recovery.rtt())
+                } else {
+                    // Least pto count first.
+                    filtered.min_by_key(|(_, p)| p.recovery.pto_count)
+                }
                     .map(|(pid, _)| pid)
                 {
-                    return Ok(pid);
+                    return Ok((pid, use_failure || consider_pf || consider_failure));
                 }
                 if consider_standby || !self.paths.consider_standby_paths() {
-                    break;
+                    if consider_pf {
+                        if consider_failure {
+                            break;
+                        } else {
+                            consider_failure = true;
+                        }
+                    } else {
+                        consider_pf = true;
+                    }
                 }
-                consider_standby = true;
             }
         }
 
@@ -7614,7 +7692,7 @@ impl Connection {
                             .flatten()
                     })
             {
-                return Ok(pid);
+                return Ok((pid, use_failure));
             }
         }
 
@@ -7627,7 +7705,7 @@ impl Connection {
                 return Err(Error::Done);
             }
 
-            return Ok(pid);
+            return Ok((pid, use_failure));
         };
 
         Err(Error::InvalidState)
@@ -7658,8 +7736,13 @@ impl Connection {
                 .ok_or(Error::OutOfIdentifiers)?
         };
 
-        let path =
-            path::Path::new(local_addr, peer_addr, &self.recovery_config, false);
+        let path = path::Path::new(
+            local_addr,
+            peer_addr,
+            &self.recovery_config,
+            self.pf_max_pto,
+            false
+        );
 
         let pid = self
             .paths
@@ -13579,7 +13662,7 @@ mod tests {
             pipe.client.paths.get_active_path_id().expect("no active");
         let (ty, len) = pipe
             .client
-            .send_single(&mut buf, active_pid, false)
+            .send_single(&mut buf, active_pid, false, false)
             .unwrap();
         assert_eq!(ty, Type::Initial);
 
@@ -13588,7 +13671,7 @@ mod tests {
         // Client sends Handshake packet.
         let (ty, len) = pipe
             .client
-            .send_single(&mut buf, active_pid, false)
+            .send_single(&mut buf, active_pid, false, false)
             .unwrap();
         assert_eq!(ty, Type::Handshake);
 
@@ -15289,14 +15372,15 @@ mod tests {
             pipe.client.send_on_path(
                 &mut buf,
                 Some(client_addr),
-                Some(server_addr)
+                Some(server_addr),
+                false
             ),
             Err(Error::Done)
         );
         // Client should send padded PATH_CHALLENGE.
         let (sent, si) = pipe
             .client
-            .send_on_path(&mut buf, Some(client_addr_2), Some(server_addr))
+            .send_on_path(&mut buf, Some(client_addr_2), Some(server_addr), false)
             .expect("No error");
         assert_eq!(sent, MIN_CLIENT_INITIAL_LEN);
         assert_eq!(si.from, client_addr_2);
@@ -15308,7 +15392,8 @@ mod tests {
             pipe.client.send_on_path(
                 &mut buf,
                 Some(client_addr_3),
-                Some(server_addr)
+                Some(server_addr),
+                false
             ),
             Err(Error::InvalidState)
         );
@@ -15316,7 +15401,8 @@ mod tests {
             pipe.client.send_on_path(
                 &mut buf,
                 Some(client_addr),
-                Some(server_addr_2)
+                Some(server_addr_2),
+                false
             ),
             Err(Error::InvalidState)
         );
@@ -15342,7 +15428,7 @@ mod tests {
         // PATH_CHALLENGE
         let (sent, si) = pipe
             .client
-            .send_on_path(&mut buf, Some(client_addr), None)
+            .send_on_path(&mut buf, Some(client_addr), None, false)
             .expect("No error");
         assert_eq!(sent, MIN_CLIENT_INITIAL_LEN);
         assert_eq!(si.from, client_addr);
@@ -15350,14 +15436,14 @@ mod tests {
         // STREAM frame on active path.
         let (_, si) = pipe
             .client
-            .send_on_path(&mut buf, Some(client_addr), None)
+            .send_on_path(&mut buf, Some(client_addr), None, false)
             .expect("No error");
         assert_eq!(si.from, client_addr);
         assert_eq!(si.to, server_addr);
         // PATH_CHALLENGE
         let (sent, si) = pipe
             .client
-            .send_on_path(&mut buf, None, Some(server_addr))
+            .send_on_path(&mut buf, None, Some(server_addr), false)
             .expect("No error");
         assert_eq!(sent, MIN_CLIENT_INITIAL_LEN);
         assert_eq!(si.from, client_addr_3);
@@ -15365,18 +15451,18 @@ mod tests {
         // STREAM frame on active path.
         let (_, si) = pipe
             .client
-            .send_on_path(&mut buf, None, Some(server_addr))
+            .send_on_path(&mut buf, None, Some(server_addr), false)
             .expect("No error");
         assert_eq!(si.from, client_addr);
         assert_eq!(si.to, server_addr);
 
         // No more data to exchange leads to Error::Done.
         assert_eq!(
-            pipe.client.send_on_path(&mut buf, Some(client_addr), None),
+            pipe.client.send_on_path(&mut buf, Some(client_addr), None, false),
             Err(Error::Done)
         );
         assert_eq!(
-            pipe.client.send_on_path(&mut buf, None, Some(server_addr)),
+            pipe.client.send_on_path(&mut buf, None, Some(server_addr), false),
             Err(Error::Done)
         );
 
@@ -16396,6 +16482,596 @@ mod tests {
         let pipe = pipe_with_exchanged_cids(&mut config, 0, 16, 1);
 
         assert_eq!(pipe.client.is_multipath_enabled(), false);
+    }
+
+    #[test]
+    fn multipath_early_retransmit_to_same_path() {
+        let mut buf = [0; 65535];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_bidi_local(100000);
+        config.set_initial_max_stream_data_bidi_remote(100000);
+        config.set_initial_max_streams_bidi(2);
+        config.set_multipath(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+        assert_eq!(pipe.client.is_multipath_enabled(), true);
+        assert_eq!(pipe.server.is_multipath_enabled(), true);
+
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2))
+        );
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        let pid_c2s_0 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr, server_addr))
+            .expect("no such path");
+        let pid_c2s_1 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr_2, server_addr))
+            .expect("no such path");
+        let pid_s2c_0 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr))
+            .expect("no such path");
+        let pid_s2c_1 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr_2))
+            .expect("no such path");
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), false);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), false);
+
+        assert_eq!(
+            pipe.client.set_active(client_addr_2, server_addr, true,),
+            Ok(())
+        );
+        assert_eq!(
+            pipe.server.set_active(server_addr, client_addr_2, true,),
+            Ok(())
+        );
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), true);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), true);
+
+        // Flush the ACK_MP on the newly active path.
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Client sends stream data, but packet is lost
+        assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+        let res = pipe.client.send(&mut buf);
+        assert!(res.is_ok());
+        let (_, send_info) = res.unwrap();
+
+        let pid_c2s_send = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(send_info.from, send_info.to))
+            .expect("no such path");
+
+        // Wait until PTO expires. Since the RTT is very low, wait a bit more.
+        let timer = pipe.client.timeout().unwrap();
+        std::thread::sleep(timer + time::Duration::from_millis(1));
+
+        pipe.client.on_timeout();
+
+        let epoch = packet::Epoch::Application;
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_send)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            1,
+        );
+
+        // Client retransmits stream data in PTO probe.
+        let res = pipe.client.send(&mut buf);
+        assert!(res.is_ok());
+        let (len, send_info) = res.unwrap();
+
+        let pid_c2s_pto = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(send_info.from, send_info.to))
+            .expect("no such path");
+
+        assert_eq!(pid_c2s_send, pid_c2s_pto);
+
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_pto)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            0,
+        );
+        let frames =
+            testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
+
+        let mut iter = frames.iter();
+
+        // Skip ACK_MP frame.
+        iter.next();
+        iter.next();
+
+        assert_eq!(
+            iter.next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 0,
+                data: stream::RangeBuf::from(b"a", 0, false),
+            })
+        );
+        assert_eq!(pipe.client.stats().retrans, 1);
+
+    }
+
+    #[test]
+    fn multipath_send_ping() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_bidi_local(100000);
+        config.set_initial_max_stream_data_bidi_remote(100000);
+        config.set_initial_max_streams_bidi(2);
+        config.set_multipath(true);
+
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+        assert_eq!(pipe.client.is_multipath_enabled(), true);
+        assert_eq!(pipe.server.is_multipath_enabled(), true);
+
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2))
+        );
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+
+        let pid_c2s_0 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr, server_addr))
+            .expect("no such path");
+        let pid_c2s_1 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr_2, server_addr))
+            .expect("no such path");
+        let pid_s2c_0 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr))
+            .expect("no such path");
+        let pid_s2c_1 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr_2))
+            .expect("no such path");
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), false);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), false);
+
+        assert_eq!(
+            pipe.client.set_active(client_addr_2, server_addr, true,),
+            Ok(())
+        );
+        assert_eq!(
+            pipe.server.set_active(server_addr, client_addr_2, true,),
+            Ok(())
+        );
+
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), true);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), true);
+
+        pipe.client.set_path_status(client_addr_2, server_addr, PathStatus::Standby, false).unwrap();
+
+        // Flush the ACK_MP on the newly active path.
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let pairs = [(client_addr, pid_c2s_0), (client_addr_2, pid_c2s_1)];
+        for (client_addr, pid_c2s) in pairs {
+            // Queue a PING frame
+            pipe.client.send_ack_eliciting_on_path(client_addr, server_addr).unwrap();
+
+            // Make sure ping is sent to the correct path
+            let mut buf = [0; 1500];
+            let res = pipe.client.send(&mut buf);
+            assert!(res.is_ok());
+            let (len, send_info) = res.unwrap();
+
+            let pid_c2s_ping = pipe
+                .client
+                .paths
+                .path_id_from_addrs(&(send_info.from, send_info.to))
+                .expect("no such path");
+
+            assert_eq!(pid_c2s_ping, pid_c2s);
+
+            let frames =
+                testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
+            let mut iter = frames.iter();
+
+            assert_eq!(iter.next(), Some(&frame::Frame::Ping));
+        }
+    }
+
+    #[test]
+    fn multipath_failover() {
+        let mut buf = [0; 65535];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.verify_peer(false);
+        config.set_active_connection_id_limit(3);
+        config.set_initial_max_data(100000);
+        config.set_initial_max_stream_data_bidi_local(100000);
+        config.set_initial_max_stream_data_bidi_remote(100000);
+        config.set_initial_max_streams_bidi(2);
+        config.set_multipath(true);
+    
+        let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+    
+        assert_eq!(pipe.client.is_multipath_enabled(), true);
+        assert_eq!(pipe.server.is_multipath_enabled(), true);
+    
+        let client_addr = testing::Pipe::client_addr();
+        let server_addr = testing::Pipe::server_addr();
+        let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    
+        assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.client.path_event_next(),
+            Some(PathEvent::Validated(client_addr_2, server_addr))
+        );
+        assert_eq!(pipe.client.path_event_next(), None);
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::New(server_addr, client_addr_2))
+        );
+        assert_eq!(
+            pipe.server.path_event_next(),
+            Some(PathEvent::Validated(server_addr, client_addr_2))
+        );
+        assert_eq!(pipe.server.path_event_next(), None);
+    
+        let pid_c2s_0 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr, server_addr))
+            .expect("no such path");
+        let pid_c2s_1 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(client_addr_2, server_addr))
+            .expect("no such path");
+        let pid_s2c_0 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr))
+            .expect("no such path");
+        let pid_s2c_1 = pipe
+            .server
+            .paths
+            .path_id_from_addrs(&(server_addr, client_addr_2))
+            .expect("no such path");
+    
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+    
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), false);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), false);
+    
+        assert_eq!(
+            pipe.client.set_active(client_addr_2, server_addr, true,),
+            Ok(())
+        );
+        assert_eq!(
+            pipe.server.set_active(server_addr, client_addr_2, true,),
+            Ok(())
+        );
+    
+        let path_c2s_0 = pipe.client.paths.get(pid_c2s_0).expect("no such path");
+        let path_c2s_1 = pipe.client.paths.get(pid_c2s_1).expect("no such path");
+        let path_s2c_0 = pipe.server.paths.get(pid_s2c_0).expect("no such path");
+        let path_s2c_1 = pipe.server.paths.get(pid_s2c_1).expect("no such path");
+    
+        assert_eq!(path_c2s_0.active(), true);
+        assert_eq!(path_c2s_1.active(), true);
+        assert_eq!(path_s2c_0.active(), true);
+        assert_eq!(path_s2c_1.active(), true);
+
+        // Client sends stream data, but packet is lost
+        assert_eq!(pipe.client.stream_send(0, b"a", false), Ok(1));
+        let res = pipe.client.send(&mut buf);
+        assert!(res.is_ok());
+        let (_, send_info) = res.unwrap();
+
+        let pid_c2s_send = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(send_info.from, send_info.to))
+            .expect("no such path");
+
+        // Wait until PTO expires. Since the RTT is very low, wait a bit more.
+        let timer = pipe.client.timeout().unwrap();
+        std::thread::sleep(timer + time::Duration::from_millis(1));
+
+        pipe.client.on_timeout();
+
+        let epoch = packet::Epoch::Application;
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_send)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            1,
+        );
+
+        // Client retransmits stream data in PTO probe.
+        let res = pipe.client.send(&mut buf);
+        assert!(res.is_ok());
+        let (len, send_info) = res.unwrap();
+
+        let pid_c2s_pto = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(send_info.from, send_info.to))
+            .expect("no such path");
+
+        assert_eq!(pid_c2s_send, pid_c2s_pto);
+
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_send)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            0,
+        );
+        let frames =
+            testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
+
+        let mut iter = frames.iter();
+
+        // Skip ACK_MP frame.
+        iter.next();
+        iter.next();
+
+        assert_eq!(
+            iter.next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 0,
+                data: stream::RangeBuf::from(b"a", 0, false),
+            })
+        );
+        assert_eq!(pipe.client.stats().retrans, 1);
+
+        // Wait until PTO expires. Since the RTT is very low, wait a bit more.
+        let timer = pipe.client.timeout().unwrap();
+        std::thread::sleep(timer + time::Duration::from_millis(1));
+
+        pipe.client.on_timeout();
+
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_send)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            2,
+        );
+
+        // Client transmits ping in PTO probe.
+        let res = pipe.client.send(&mut buf);
+        assert!(res.is_ok());
+        let (len, send_info) = res.unwrap();
+
+        let pid_c2s_pto = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(send_info.from, send_info.to))
+            .expect("no such path");
+
+        assert_eq!(pid_c2s_send, pid_c2s_pto);
+
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_send)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            1,
+        );
+
+        let frames =
+        testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
+
+        let mut iter = frames.iter();
+
+        assert_eq!(
+            iter.next(),
+            Some(&frame::Frame::Ping)
+        );
+
+        // Client transmits ping in PTO probe.
+        let res = pipe.client.send(&mut buf);
+        assert!(res.is_ok());
+        let (len, send_info) = res.unwrap();
+
+        let pid_c2s_pto = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(send_info.from, send_info.to))
+            .expect("no such path");
+
+        assert_eq!(pid_c2s_send, pid_c2s_pto);
+
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_send)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            0,
+        );
+
+        let frames =
+        testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
+
+        let mut iter = frames.iter();
+
+        assert_eq!(
+            iter.next(),
+            Some(&frame::Frame::Ping)
+        );
+
+        // Client retransmits stream data on another path.
+        let res = pipe.client.send(&mut buf);
+        assert!(res.is_ok());
+        let (len, send_info) = res.unwrap();
+
+        let pid_c2s_send1 = pipe
+            .client
+            .paths
+            .path_id_from_addrs(&(send_info.from, send_info.to))
+            .expect("no such path");
+
+        assert_ne!(pid_c2s_send1, pid_c2s_send);
+
+        assert_eq!(
+            pipe.client
+                .paths
+                .get(pid_c2s_send1)
+                .expect("no such path")
+                .recovery
+                .loss_probes[epoch],
+            0,
+        );
+
+        let frames =
+        testing::decode_pkt(&mut pipe.server, &mut buf, len).unwrap();
+
+        let mut iter = frames.iter();
+
+        // Skip ACK_MP frame.
+        iter.next();
+        iter.next();
+
+        assert_eq!(
+            iter.next(),
+            Some(&frame::Frame::Stream {
+                stream_id: 0,
+                data: stream::RangeBuf::from(b"a", 0, false),
+            })
+        );
     }
 }
 
