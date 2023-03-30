@@ -7666,6 +7666,8 @@ impl Connection {
                     } else {
                         consider_pf = true;
                     }
+                } else {
+                    consider_standby = true;
                 }
             }
         }
@@ -17082,6 +17084,7 @@ pub use crate::packet::Type;
 pub use crate::path::PathEvent;
 pub use crate::path::PathStats;
 pub use crate::path::PathStatus;
+pub use crate::path::PathFailureState;
 pub use crate::path::SocketAddrIter;
 
 pub use crate::recovery::CongestionControlAlgorithm;

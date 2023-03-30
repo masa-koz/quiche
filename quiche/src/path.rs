@@ -595,6 +595,7 @@ impl Path {
             && self.not_failure()
             && self.recovery.pto_count > self.pf_max_pto
         {
+            info!("({} {}) is marked as pf", self.local_addr, self.peer_addr);
             self.failure = PathFailureState::PotentialFailure;
             self.recovery.mark_all_inflight_as_lost(now, trace_id)
         } else {
@@ -658,6 +659,7 @@ impl Path {
             validation_state: self.validation_state,
             state: self.state.clone(),
             active: self.active(),
+            failure: self.failure,
             recv: self.recv_count,
             sent: self.sent_count,
             lost: self.recovery.lost_count,
@@ -672,6 +674,7 @@ impl Path {
             stream_retrans_bytes: self.stream_retrans_bytes,
             pmtu: self.recovery.max_datagram_size(),
             delivery_rate: self.recovery.delivery_rate(),
+            pto_count: self.recovery.pto_count,
         }
     }
 }
@@ -1239,6 +1242,9 @@ pub struct PathStats {
     /// The path state.
     state: PathState,
 
+    /// The path failure.
+    pub failure: PathFailureState,
+
     /// Is it active?
     pub active: bool,
 
@@ -1290,6 +1296,9 @@ pub struct PathStats {
     /// [`SendInfo.at`]: struct.SendInfo.html#structfield.at
     /// [Pacing]: index.html#pacing
     pub delivery_rate: u64,
+
+    /// PTO count
+    pub pto_count: u32,
 }
 
 impl std::fmt::Debug for PathStats {

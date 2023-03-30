@@ -36,6 +36,7 @@ use std::rc::Rc;
 
 use std::cell::RefCell;
 
+use quiche::PathFailureState;
 use ring::rand::*;
 
 use slab::Slab;
@@ -502,7 +503,7 @@ pub fn connect(
         }
 
         // Determine in which order we are going to iterate over paths.
-        let scheduled_tuples = lowest_latency_scheduler(&conn);
+        let scheduled_tuples = lowest_latency_scheduler(&conn).chain(failure_scheduler(&conn));
 
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
@@ -661,6 +662,17 @@ fn lowest_latency_scheduler(
 ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
     use itertools::Itertools;
     conn.path_stats()
+        .filter(|p| p.failure == PathFailureState::NotFailure)
         .sorted_by_key(|p| p.rtt)
+        .map(|p| (p.local_addr, p.peer_addr))
+}
+
+fn failure_scheduler(
+    conn: &quiche::Connection,
+) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
+    use itertools::Itertools;
+    conn.path_stats()
+        .filter(|p| p.failure != PathFailureState::NotFailure)
+        .sorted_by_key(|p| p.pto_count)
         .map(|p| (p.local_addr, p.peer_addr))
 }
