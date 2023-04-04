@@ -7597,6 +7597,7 @@ impl Connection {
             .map(|(pid, _)| pid);
 
         if let Some(pid) = pto.next() {
+            info!("select {} for sending probing packet", pid);
             return Ok((pid, use_failure));
         }
 
@@ -7613,6 +7614,7 @@ impl Connection {
                 .map(|(pid, _)| pid);
 
             if let Some(pid) = probing.next() {
+                info!("select {} for path probing", pid);
                 return Ok((pid, use_failure));
             }
         }
@@ -7651,6 +7653,7 @@ impl Connection {
                     .min_by_key(|(_, p)| p.recovery.rtt()) // Lowest-latency first.
                     .map(|(pid, _)| pid)
                 {
+                    info!("select not failure {} when consider_standby: {}", pid, consider_standby);
                     return Ok((pid, use_failure));
                 }
                 if consider_standby || !self.paths.consider_standby_paths() {
@@ -7680,6 +7683,7 @@ impl Connection {
                     .min_by_key(|(_, p)| p.recovery.pto_count) // Least pto count first.
                     .map(|(pid, _)| pid)
                 {
+                    info!("select {} from pf/failure when consider_failure: {}", pid, consider_failure);
                     return Ok((pid, true));
                 }
                 if consider_failure {
@@ -7718,6 +7722,7 @@ impl Connection {
                                 .flatten()
                         })
                 {
+                    info!("select {} for sending MP_ACK when consider_pf: {}, consider_failure: {}", pid, consider_pf, consider_failure);
                     return Ok((pid, use_failure | consider_pf | consider_failure));
                 }
                 if consider_pf {
@@ -7746,11 +7751,13 @@ impl Connection {
                         let peer = to.map(|t| t == p.peer_addr()).unwrap_or(true);
                         local && peer
                             && p.active()
+                            && (consider_pf || consider_failure || p.not_failure())
                             && (consider_failure || !p.failure())
                     }).map(|(pid, _)| pid)
                     .next()
                 {
-                    return Ok((pid, use_failure));
+                    info!("select {} for last resort when consider_pf: {}, consider_failure: {}", pid, consider_pf, consider_failure);
+                    return Ok((pid, use_failure | consider_pf | consider_failure));
                 }
                 if consider_pf {
                     if consider_failure {
@@ -7763,7 +7770,7 @@ impl Connection {
                 }
             }
         }
-        
+
         if let Some((pid, p)) = self.paths.get_active_with_pid() {
             if from.is_some() && Some(p.local_addr()) != from {
                 return Err(Error::Done);
@@ -7773,6 +7780,7 @@ impl Connection {
                 return Err(Error::Done);
             }
 
+            info!("select {} from all active", pid);
             return Ok((pid, use_failure));
         };
 
