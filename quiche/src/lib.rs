@@ -7618,17 +7618,16 @@ impl Connection {
         }
 
         let mut consider_standby = false;
-        let mut consider_pf = false;
-        let mut consider_failure = false;
         let dgrams_to_emit = self.dgram_send_queue.has_pending();
         let stream_to_emit = self.streams.has_flushable();
         // When using aggregate mode, favour lowest-latency path on which CWIN
         // is open. This should only be used when data need to be sent.
         // If we have standby paths, we may run the loop a second time.
         if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
+            let mut not_failure_exists = false;
             // We loop at most twice.
             loop {
-                let filtered = self
+                let mut filtered = self
                     .paths
                     .iter()
                     .filter(|(_, p)| {
@@ -7639,65 +7638,132 @@ impl Connection {
                         local && peer
                             && p.active()
                             && (consider_standby || !p.is_standby())
-                            && (p.not_failure()
-                                || (consider_pf && !p.failure())
-                                || consider_failure
-                                || use_failure)
-                            && p.recovery.cwnd_available() > 0
-                    });
-                if let Some(pid) = if !consider_pf && !consider_failure {
-                    // Lowest-latency first.
-                    filtered.min_by_key(|(_, p)| p.recovery.rtt())
-                } else {
-                    // Least pto count first.
-                    filtered.min_by_key(|(_, p)| p.recovery.pto_count)
+                            && p.not_failure()
+                    })
+                    .peekable();
+
+                if filtered.peek().is_some() {
+                    not_failure_exists = true;
                 }
+
+                if let Some(pid) = filtered
+                    .filter(|(_, p)| p.recovery.cwnd_available() > 0)
+                    .min_by_key(|(_, p)| p.recovery.rtt()) // Lowest-latency first.
                     .map(|(pid, _)| pid)
                 {
-                    return Ok((pid, use_failure || consider_pf || consider_failure));
+                    return Ok((pid, use_failure));
                 }
                 if consider_standby || !self.paths.consider_standby_paths() {
-                    if consider_pf {
-                        if consider_failure {
-                            break;
-                        } else {
-                            consider_failure = true;
-                        }
-                    } else {
-                        consider_pf = true;
-                    }
-                } else {
-                    consider_standby = true;
+                    break;
                 }
+                consider_standby = true;
+            }
+
+            let mut consider_failure = false;
+            // We loop at most twice.
+            loop {
+                if not_failure_exists {
+                    break;
+                }
+                if let Some(pid) = self
+                    .paths
+                    .iter()
+                    .filter(|(_, p)| {
+                        // Follow the filter provided as parameters.
+                        let local = from.map(|f| f == p.local_addr()).unwrap_or(true);
+                        let peer = to.map(|t| t == p.peer_addr()).unwrap_or(true);
+                        local && peer
+                            && p.active()
+                            && (consider_failure || !p.failure())
+                            && p.recovery.cwnd_available() > 0
+                    })
+                    .min_by_key(|(_, p)| p.recovery.pto_count) // Least pto count first.
+                    .map(|(pid, _)| pid)
+                {
+                    return Ok((pid, true));
+                }
+                if consider_failure {
+                    break;
+                }
+                consider_failure = true;
             }
         }
 
         // When using multiple packet number spaces, let's force ACK_MP sending
         // on their corresponding paths.
         if self.is_multipath_enabled() {
-            if let Some(pid) =
-                self.pkt_num_spaces
-                    .spaces
-                    .application_data_space_ids()
-                    .find_map(|seq| {
-                        self.pkt_num_spaces
-                            .is_ready(packet::Epoch::Application, Some(seq))
-                            .then(|| {
-                                self.ids.get_scid(seq).ok().and_then(|e| {
-                                    e.path_id.and_then(|pid| {
-                                        self.paths.get(pid).ok().and_then(|p| {
-                                            p.active().then_some(pid)
+            let mut consider_pf = false;
+            let mut consider_failure = false;
+            loop {
+                if let Some(pid) =
+                    self.pkt_num_spaces
+                        .spaces
+                        .application_data_space_ids()
+                        .find_map(|seq| {
+                            self.pkt_num_spaces
+                                .is_ready(packet::Epoch::Application, Some(seq))
+                                .then(|| {
+                                    self.ids.get_scid(seq).ok().and_then(|e| {
+                                        e.path_id.and_then(|pid| {
+                                            self.paths.get(pid).ok().and_then(|p| {
+                                                (p.active()
+                                                    && (consider_pf || consider_failure || p.not_failure())
+                                                    && (consider_failure || !p.failure())
+                                                )
+                                                .then_some(pid)
+                                            })
                                         })
                                     })
                                 })
-                            })
-                            .flatten()
-                    })
-            {
-                return Ok((pid, use_failure));
+                                .flatten()
+                        })
+                {
+                    return Ok((pid, use_failure | consider_pf | consider_failure));
+                }
+                if consider_pf {
+                    if consider_failure {
+                        break;
+                    } else {
+                        consider_failure = true;
+                    }
+                } else {
+                    consider_pf = true;
+                }
             }
         }
 
+        if self.paths.multipath() {
+            let mut consider_pf = false;
+            let mut consider_failure = false;
+
+            loop {
+                if let Some(pid) = self
+                    .paths
+                    .iter()
+                    .filter(|(_, p)| {
+                        // Follow the filter provided as parameters.
+                        let local = from.map(|f| f == p.local_addr()).unwrap_or(true);
+                        let peer = to.map(|t| t == p.peer_addr()).unwrap_or(true);
+                        local && peer
+                            && p.active()
+                            && (consider_failure || !p.failure())
+                    }).map(|(pid, _)| pid)
+                    .next()
+                {
+                    return Ok((pid, use_failure));
+                }
+                if consider_pf {
+                    if consider_failure {
+                        break;
+                    } else {
+                        consider_failure = true;
+                    }
+                } else {
+                    consider_pf = true;
+                }
+            }
+        }
+        
         if let Some((pid, p)) = self.paths.get_active_with_pid() {
             if from.is_some() && Some(p.local_addr()) != from {
                 return Err(Error::Done);
