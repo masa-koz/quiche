@@ -7651,7 +7651,7 @@ impl Connection {
                     .min_by_key(|(_, p)| p.recovery.rtt()) // Lowest-latency first.
                     .map(|(pid, _)| pid)
                 {
-                    info!("select not failure {} when consider_standby: {}", pid, consider_standby);
+                    info!("select {} from not failure when consider_standby: {}", pid, consider_standby);
                     return Ok((pid, use_failure));
                 }
                 if consider_standby || !self.paths.consider_standby_paths() {
