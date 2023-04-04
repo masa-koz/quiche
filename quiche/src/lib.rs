@@ -3524,8 +3524,7 @@ impl Connection {
                     self.local_error
                         .as_ref()
                         .map_or(false, |le| le.is_app))) &&
-            path.active() &&
-            (path.not_failure() || use_failure)
+            path.active()
         {
             let ack_delay = pkt_space.largest_rx_pkt_time.elapsed();
 
@@ -3556,8 +3555,7 @@ impl Connection {
         // Create ACK_MP frames if needed.
         if multiple_application_data_pkt_num_spaces &&
             !is_closing &&
-            path.active() &&
-            (path.not_failure() || use_failure)
+            path.active()
         {
             // We first check if we should bundle the ACK_MP belonging to our
             // path. We only bundle additional ACK_MP from other paths if we
@@ -3589,7 +3587,7 @@ impl Connection {
                         wrote_ack_mp = true;
                     }
                 }
-                if wrote_ack_mp {
+                if wrote_ack_mp && (path.not_failure() || use_failure) {
                     for space_id in self
                         .pkt_num_spaces
                         .spaces
@@ -7722,8 +7720,8 @@ impl Connection {
                                 .flatten()
                         })
                 {
-                    info!("select {} for sending MP_ACK when consider_pf: {}, consider_failure: {}", pid, consider_pf, consider_failure);
-                    return Ok((pid, use_failure | consider_pf | consider_failure));
+                    info!("select {} for sending ACK_MP when consider_pf: {}, consider_failure: {}", pid, consider_pf, consider_failure);
+                    return Ok((pid, use_failure));
                 }
                 if consider_pf {
                     if consider_failure {
